@@ -1,8 +1,11 @@
-import { PrismaClient, ApiKeyScope } from "@prisma/client";
+import { PrismaClient, ApiKeyScope, type Prisma } from "@prisma/client";
 import { compare, hash } from "bcryptjs";
 import { randomUUID } from "crypto";
 import * as crypto from "crypto";
+import type { Cluster, Redis } from "ioredis";
 import { env } from "../../env";
+import { logger } from "../logger";
+import { invalidateCachedApiKeys } from "./invalidateApiKeys";
 
 export function getDisplaySecretKey(secretKey: string) {
   return secretKey.slice(0, 6) + "..." + secretKey.slice(-4);
@@ -14,7 +17,7 @@ export async function hashSecretKey(key: string) {
   return hashedKey;
 }
 
-async function generateKeySet() {
+export async function generateKeySet() {
   return {
     pk: `pk-lf-${randomUUID()}`,
     sk: `sk-lf-${randomUUID()}`,
@@ -37,10 +40,17 @@ export function createShaHash(privateKey: string, salt: string): string {
 }
 
 export async function createAndAddApiKeysToDb(p: {
-  prisma: PrismaClient;
+  // Accepts a transaction client so callers can commit key creation
+  // atomically with linking the key to its owner (e.g. an agent run row).
+  prisma: PrismaClient | Prisma.TransactionClient;
   entityId: string;
   scope: ApiKeyScope;
   note?: string;
+  isInAppAgentKey?: boolean;
+  /** User who created the key, e.g. via the UI. */
+  createdByUserId?: string;
+  /** API key that created the key, e.g. an org-scoped key using the public API. */
+  createdByApiKeyId?: string;
   predefinedKeys?: {
     secretKey: string;
     publicKey: string;
@@ -72,6 +82,9 @@ export async function createAndAddApiKeysToDb(p: {
       fastHashedSecretKey: hashFromProvidedKey,
       note: p.note,
       scope: p.scope,
+      isInAppAgentKey: p.isInAppAgentKey ?? false,
+      createdByUserId: p.createdByUserId,
+      createdByApiKeyId: p.createdByApiKeyId,
     },
   });
 
@@ -83,4 +96,67 @@ export async function createAndAddApiKeysToDb(p: {
     secretKey: sk,
     displaySecretKey: displaySk,
   };
+}
+
+export async function deleteApiKeyFromDb(p: {
+  prisma: PrismaClient;
+  id: string;
+  entityId: string;
+  scope: ApiKeyScope;
+  redis?: Redis | Cluster | null;
+  /**
+   * When true, only delete keys minted for in-app agent MCP sessions.
+   * A matching project key that is not an agent key is left intact.
+   */
+  isInAppAgentKey?: boolean;
+}) {
+  const entity =
+    p.scope === "PROJECT" ? { projectId: p.entityId } : { orgId: p.entityId };
+
+  const apiKey = await p.prisma.apiKey.findFirstOrThrow({
+    where: {
+      ...entity,
+      id: p.id,
+      scope: p.scope,
+    },
+  });
+
+  if (p.isInAppAgentKey === true && apiKey.isInAppAgentKey !== true) {
+    logger.warn(
+      "Refusing to delete API key that is not an in-app agent MCP key",
+      {
+        apiKeyId: p.id,
+        entityId: p.entityId,
+        scope: p.scope,
+      },
+    );
+    return false;
+  }
+
+  await invalidateCachedApiKeys([apiKey], `key ${p.id}`, p.redis);
+
+  await p.prisma.apiKey.delete({
+    where: {
+      id: apiKey.id,
+    },
+  });
+
+  return true;
+}
+
+/** Delete an in-app agent MCP session key. Skips user project keys. */
+export async function deleteInAppAgentMcpApiKeyFromDb(p: {
+  prisma: PrismaClient;
+  id: string;
+  projectId: string;
+  redis?: Redis | Cluster | null;
+}) {
+  return deleteApiKeyFromDb({
+    prisma: p.prisma,
+    id: p.id,
+    entityId: p.projectId,
+    scope: "PROJECT",
+    redis: p.redis,
+    isInAppAgentKey: true,
+  });
 }

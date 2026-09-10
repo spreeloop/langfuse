@@ -1,27 +1,41 @@
 import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
 import { type NextApiRequest, type NextApiResponse } from "next";
-import { z } from "zod/v4";
+import { z } from "zod";
 import {
   traceException,
   redis,
   logger,
   getCurrentSpan,
   contextWithLangfuseProps,
+  eventTypes,
+  markProjectIngestFailure,
+  createIngestionAttribution,
+  processEventBatch,
 } from "@langfuse/shared/src/server";
 import { telemetry } from "@/src/features/telemetry";
-import { jsonSchema } from "@langfuse/shared";
-import { isPrismaException } from "@/src/utils/exceptions";
+import { clickHouseRouteForRequest } from "@/src/features/public-api/server/clickHouseRequestTags";
 import {
+  jsonSchema,
   MethodNotAllowedError,
   BaseError,
   UnauthorizedError,
   ForbiddenError,
 } from "@langfuse/shared";
-import { processEventBatch } from "@langfuse/shared/src/server";
+import { isPrismaException } from "@/src/utils/exceptions";
 import { prisma } from "@langfuse/shared/src/db";
 import { ApiAuthService } from "@/src/features/public-api/server/apiAuth";
 import { RateLimitService } from "@/src/features/public-api/server/RateLimitService";
 import * as opentelemetry from "@opentelemetry/api";
+import { env } from "@/src/env.mjs";
+import {
+  attachDeprecation,
+  INGESTION_DEPRECATION,
+} from "@/src/features/public-api/server/deprecations";
+import {
+  SDK_NAME_ATTRIBUTE,
+  SDK_VERSION_ATTRIBUTE,
+  extractSdkAttributes,
+} from "@langfuse/shared/instrumentation/bootstrap";
 
 export const config = {
   api: {
@@ -51,13 +65,17 @@ export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse,
 ) {
+  let projectIdForIngestFailure: string | undefined;
+
   try {
     await runMiddleware(req, res, cors);
 
     // add context of api call to the span
     const currentSpan = getCurrentSpan();
 
-    // get x-langfuse-xxx headers and add them to the span
+    // Preserve the raw x-langfuse-* attributes consumed by existing ingestion
+    // dashboards. The canonical attributes below are shared by all public API
+    // routes and intentionally use a bounded SDK name/version vocabulary.
     Object.keys(req.headers).forEach((header) => {
       if (
         header.toLowerCase().startsWith("x-langfuse") ||
@@ -69,6 +87,14 @@ export default async function handler(
         });
       }
     });
+
+    const { sdkName, sdkVersion } = extractSdkAttributes(req.headers);
+    if (sdkName) {
+      currentSpan?.setAttribute(SDK_NAME_ATTRIBUTE, sdkName);
+    }
+    if (sdkVersion) {
+      currentSpan?.setAttribute(SDK_VERSION_ATTRIBUTE, sdkVersion);
+    }
 
     if (req.method !== "POST") throw new MethodNotAllowedError();
 
@@ -86,6 +112,8 @@ export default async function handler(
         "Missing projectId in scope. Are you using an organization key?",
       );
     }
+    const projectId = authCheck.scope.projectId;
+    projectIdForIngestFailure = projectId;
 
     if (authCheck.scope.isIngestionSuspended) {
       throw new ForbiddenError(
@@ -95,64 +123,118 @@ export default async function handler(
 
     const ctx = contextWithLangfuseProps({
       headers: req.headers,
-      projectId: authCheck.scope.projectId,
+      projectId,
+      apiKeyId: authCheck.scope.apiKeyId,
+      clickhouse: {
+        surface: "publicapi",
+        route: clickHouseRouteForRequest(req),
+      },
     });
     // Execute the rest of the handler within the context
     return opentelemetry.context.with(ctx, async () => {
       try {
-        const rateLimitCheck =
-          await RateLimitService.getInstance().rateLimitRequest(
-            authCheck.scope,
-            "ingestion",
-          );
+        try {
+          const rateLimitCheck =
+            await RateLimitService.getInstance().rateLimitRequest(
+              authCheck.scope,
+              "ingestion",
+            );
 
-        if (rateLimitCheck?.isRateLimited()) {
-          return rateLimitCheck.sendRestResponseIfLimited(res);
+          if (rateLimitCheck?.isRateLimited()) {
+            return rateLimitCheck.sendRestResponseIfLimited(res);
+          }
+        } catch (e) {
+          // If rate-limiter returns an error, we log it and continue processing.
+          // This allows us to fail open instead of reject requests.
+          logger.error("Error while rate limiting", e);
         }
-      } catch (e) {
-        // If rate-limiter returns an error, we log it and continue processing.
-        // This allows us to fail open instead of reject requests.
-        logger.error("Error while rate limiting", e);
-      }
 
-      const batchType = z.object({
-        batch: z.array(z.unknown()),
-        metadata: jsonSchema.nullish(),
-      });
-
-      const parsedSchema = batchType.safeParse(req.body);
-
-      if (!parsedSchema.success) {
-        logger.info("Invalid request data", parsedSchema.error);
-        return res.status(400).json({
-          message: "Invalid request data",
-          errors: parsedSchema.error.issues.map((issue) => issue.message),
+        const batchType = z.object({
+          batch: z.array(z.unknown()),
+          metadata: jsonSchema.nullish(),
         });
-      }
 
-      await telemetry();
-      const result = await processEventBatch(
-        parsedSchema.data.batch,
-        authCheck,
-      );
-      return res.status(207).json(result);
+        const parsedSchema = batchType.safeParse(req.body);
+
+        if (!parsedSchema.success) {
+          logger.info("Invalid request data", parsedSchema.error);
+          return res.status(400).json({
+            message: "Invalid request data",
+            errors: parsedSchema.error.issues.map((issue) => issue.message),
+          });
+        }
+
+        await telemetry();
+
+        // V4 events_only mode: refuse trace/observation events because their
+        // writes would land in the legacy ClickHouse tables this deployment no
+        // longer reads. Scores and SDK logs are unaffected and pass through.
+        // Reject per-event so a mixed batch still processes its score events.
+        const isEventsOnlyMode =
+          env.LANGFUSE_MIGRATION_V4_WRITE_MODE === "events_only";
+        const { batchForProcessing, rejectedErrors } = filterBatchForEventsOnly(
+          parsedSchema.data.batch,
+          isEventsOnlyMode,
+        );
+
+        const attribution = createIngestionAttribution({
+          headers: req.headers,
+          authCheck,
+        });
+
+        if (isEventsOnlyMode && rejectedErrors.length > 0) {
+          logger.warn(
+            `Rejected ${rejectedErrors.length} event(s) from the legacy /api/public/ingestion endpoint for project ${projectId} because this Langfuse v4 deployment runs in events_only mode. These events were not stored. ${EVENTS_ONLY_INGESTION_REMEDIATION}`,
+            {
+              sdkName: attribution.ingestionSdkName,
+              sdkVersion: attribution.ingestionSdkVersion,
+            },
+          );
+        }
+
+        const result = await processEventBatch(batchForProcessing, authCheck, {
+          attribution,
+        });
+        if (rejectedErrors.length > 0) {
+          result.errors = [...result.errors, ...rejectedErrors];
+        }
+
+        // Cloud-only: a 207 with every event 201 is how agents conclude the
+        // legacy write path is healthy. Stamp when the original batch asked
+        // to write a trace or observation, including events_only rejections.
+        const deprecation =
+          env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION &&
+          batchContainsTraceOrObservationEvent(parsedSchema.data.batch)
+            ? INGESTION_DEPRECATION
+            : undefined;
+
+        return res.status(207).json(attachDeprecation(result, deprecation));
+      } catch (error) {
+        if (!(error instanceof BaseError && error.isUserError())) {
+          markProjectIngestFailure(projectId, {
+            source: "public_ingestion_api",
+            reason: "api_internal_error",
+          });
+        }
+        throw error;
+      }
     });
   } catch (error: unknown) {
-    if (!(error instanceof UnauthorizedError)) {
-      logger.error("error_handling_ingestion_event", error);
-      traceException(error);
-    }
-
     if (error instanceof BaseError) {
+      if (!error.isUserError()) {
+        logger.error(error);
+        traceException(error);
+        if (projectIdForIngestFailure) {
+          markProjectIngestFailure(projectIdForIngestFailure, {
+            source: "public_ingestion_api",
+            reason: "api_internal_error",
+          });
+        }
+      }
+
       return res.status(error.httpCode).json({
         error: error.name,
         message: error.message,
-      });
-    }
-
-    if (isPrismaException(error)) {
-      return res.status(500).json({
-        error: "Internal Server Error",
       });
     }
 
@@ -164,6 +246,22 @@ export default async function handler(
       });
     }
 
+    logger.error("error_handling_ingestion_event", error);
+    traceException(error);
+
+    if (projectIdForIngestFailure) {
+      markProjectIngestFailure(projectIdForIngestFailure, {
+        source: "public_ingestion_api",
+        reason: "api_internal_error",
+      });
+    }
+
+    if (isPrismaException(error)) {
+      return res.status(500).json({
+        error: "Internal Server Error",
+      });
+    }
+
     const errorMessage =
       error instanceof Error ? error.message : "An unknown error occurred";
     res.status(500).json({
@@ -171,4 +269,94 @@ export default async function handler(
       errors: [errorMessage],
     });
   }
+}
+
+// Event types that may continue to ingest in V4 events_only mode. Scores keep
+// their own ClickHouse table (no legacy traces/observations write); SDK logs
+// are non-persisting.
+const EVENTS_ONLY_ALLOWED_TYPES = new Set<string>([
+  eventTypes.SCORE_CREATE,
+  eventTypes.SDK_LOG,
+]);
+
+const TRACE_OR_OBSERVATION_EVENT_TYPES = new Set<string>(
+  Object.values(eventTypes).filter(
+    (type) =>
+      type !== eventTypes.SCORE_CREATE &&
+      type !== eventTypes.SDK_LOG &&
+      type !== eventTypes.DATASET_RUN_ITEM_CREATE,
+  ),
+);
+
+const EVENTS_ONLY_INGESTION_DOCS_URL =
+  "https://langfuse.com/self-hosting/upgrade/upgrade-guides/upgrade-v3-to-v4";
+
+const EVENTS_ONLY_INGESTION_REMEDIATION = [
+  "Upgrade the client or integration to a v4-compatible SDK or OTLP ingestion path.",
+  "As a temporary migration bridge, set LANGFUSE_MIGRATION_V4_WRITE_MODE=dual on both the web and worker services and redeploy.",
+  `Docs: ${EVENTS_ONLY_INGESTION_DOCS_URL}`,
+].join(" ");
+
+function filterBatchForEventsOnly(
+  batch: unknown[],
+  isEventsOnlyMode: boolean,
+): {
+  batchForProcessing: unknown[];
+  rejectedErrors: {
+    id: string;
+    status: number;
+    message: string;
+    error: string;
+  }[];
+} {
+  if (!isEventsOnlyMode) {
+    return { batchForProcessing: batch, rejectedErrors: [] };
+  }
+
+  const batchForProcessing: unknown[] = [];
+  const rejectedErrors: {
+    id: string;
+    status: number;
+    message: string;
+    error: string;
+  }[] = [];
+
+  for (const event of batch) {
+    const eventObj =
+      typeof event === "object" && event !== null
+        ? (event as { id?: unknown; type?: unknown })
+        : null;
+    const type =
+      eventObj && typeof eventObj.type === "string" ? eventObj.type : null;
+    const id =
+      eventObj && typeof eventObj.id === "string" ? eventObj.id : "unknown";
+
+    if (type && EVENTS_ONLY_ALLOWED_TYPES.has(type)) {
+      batchForProcessing.push(event);
+    } else {
+      rejectedErrors.push({
+        id,
+        status: 400,
+        message: "Event type not accepted",
+        error: `Event type "${type ?? "unknown"}" is not accepted by /api/public/ingestion when LANGFUSE_MIGRATION_V4_WRITE_MODE is events_only. This endpoint only accepts score and log events. ${EVENTS_ONLY_INGESTION_REMEDIATION}`,
+      });
+    }
+  }
+
+  return { batchForProcessing, rejectedErrors };
+}
+
+function eventTypeOf(event: unknown): string | null {
+  if (typeof event !== "object" || event === null) {
+    return null;
+  }
+  const type = (event as { type?: unknown }).type;
+  return typeof type === "string" ? type : null;
+}
+
+function batchContainsTraceOrObservationEvent(batch: unknown[]): boolean {
+  return batch.some((event) => {
+    const type = eventTypeOf(event);
+    return type !== null && TRACE_OR_OBSERVATION_EVENT_TYPES.has(type);
+  });
 }

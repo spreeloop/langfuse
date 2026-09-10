@@ -2,27 +2,19 @@ import * as React from "react";
 import { api } from "@/src/utils/api";
 import { useRouter } from "next/router";
 import EvalLogTable from "@/src/features/evals/components/eval-log";
-import { StatusBadge } from "@/src/components/layouts/status-badge";
+import { StatusBadge } from "@/src/components/ui/StatusBadge/StatusBadge";
 import { DetailPageNav } from "@/src/features/navigate-detail-pages/DetailPageNav";
 import Page from "@/src/components/layouts/page";
 import { LevelCountsDisplay } from "@/src/components/level-counts-display";
+import { generateJobExecutionCounts } from "@/src/features/evals/utils/job-execution-utils";
+import { EvaluatorPausedCallout } from "@/src/features/evals/components/evaluator-paused-callout";
 import {
-  type JobExecutionState,
-  generateJobExecutionCounts,
-} from "@/src/features/evals/utils/job-execution-utils";
-
-const JobExecutionCounts = ({
-  jobExecutionsByState,
-}: {
-  jobExecutionsByState?: JobExecutionState[];
-}) => {
-  if (!jobExecutionsByState || jobExecutionsByState.length === 0) {
-    return null;
-  }
-
-  const counts = generateJobExecutionCounts(jobExecutionsByState);
-  return <LevelCountsDisplay counts={counts} />;
-};
+  type EvalTargetObject,
+  validateEvaluatorFiltersForTarget,
+} from "@langfuse/shared";
+import { useLazyEvaluatorExecutionCounts } from "@/src/features/evals/hooks/useLazyEvaluatorExecutionCounts";
+import { Alert } from "@/src/components/design-system/Alert/Alert";
+import { AlertTriangle } from "lucide-react";
 
 export const EvaluatorDetail = () => {
   const router = useRouter();
@@ -34,6 +26,22 @@ export const EvaluatorDetail = () => {
     projectId: projectId,
     id: evaluatorId,
   });
+
+  const lazyExecutionCounts = useLazyEvaluatorExecutionCounts({
+    projectId,
+    evaluatorId,
+    evaluator: evaluator.data,
+  });
+  const filterValidation = React.useMemo(() => {
+    if (!evaluator.data) {
+      return null;
+    }
+
+    return validateEvaluatorFiltersForTarget({
+      targetObject: evaluator.data.targetObject as EvalTargetObject,
+      filter: evaluator.data.filter,
+    });
+  }, [evaluator.data]);
 
   // get all templates for the current template name
   const allTemplates = api.evals.allTemplatesForName.useQuery(
@@ -66,6 +74,11 @@ export const EvaluatorDetail = () => {
           evalTemplate: evaluator.data.evalTemplate,
         }
       : undefined;
+  const displayStatus =
+    lazyExecutionCounts.displayStatus ?? evaluator.data.displayStatus;
+  const shouldRenderExecutionCounts =
+    lazyExecutionCounts.isLoading ||
+    Boolean(lazyExecutionCounts.jobExecutionCounts?.length);
 
   return (
     <Page
@@ -77,31 +90,30 @@ export const EvaluatorDetail = () => {
         breadcrumb: [
           {
             name: "LLM-as-a-Judge Evaluators",
-            href: `/project/${router.query.projectId as string}/evals`,
+            href: `/project/${router.query.projectId as string}/evals/legacy`,
           },
         ],
 
         actionButtonsRight: (
           <>
-            {evaluator.data?.jobExecutionsByState && (
-              <div className="flex flex-col items-center justify-center rounded-md bg-muted-gray px-2">
-                <JobExecutionCounts
-                  jobExecutionsByState={evaluator.data.jobExecutionsByState}
+            {shouldRenderExecutionCounts && (
+              <div className="bg-muted-gray flex min-h-6 min-w-24 flex-col items-center justify-center rounded-md px-2">
+                <LevelCountsDisplay
+                  counts={generateJobExecutionCounts(
+                    lazyExecutionCounts.jobExecutionCounts,
+                  )}
+                  isLoading={lazyExecutionCounts.isLoading}
                 />
               </div>
             )}
-            <StatusBadge
-              type={evaluator.data?.finalStatus.toLowerCase()}
-              isLive
-              className="max-h-8"
-            />
+            <StatusBadge type={displayStatus.toLowerCase()} isLive />
 
             {evaluator.data && (
               <DetailPageNav
                 key="nav"
                 currentId={encodeURIComponent(evaluator.data.id)}
                 path={(entry) =>
-                  `/project/${projectId}/evals/${encodeURIComponent(entry.id)}`
+                  `/project/${projectId}/evals/legacy/${encodeURIComponent(entry.id)}`
                 }
                 listKey="evals"
               />
@@ -112,6 +124,28 @@ export const EvaluatorDetail = () => {
     >
       {existingEvaluator && (
         <div className="flex h-full flex-col overflow-hidden">
+          {filterValidation && !filterValidation.isValid && (
+            <div className="mx-3 mt-3">
+              <Alert variant="destructive" icon={AlertTriangle}>
+                <Alert.Title>Unsupported filters</Alert.Title>
+                <Alert.Description>
+                  This evaluator contains deprecated or unsupported filters. The
+                  filters must be removed. Until the filters are removed, the
+                  evaluator is paused and will not be run.{" "}
+                </Alert.Description>
+              </Alert>
+            </div>
+          )}
+          {existingEvaluator.blockedAt && (
+            <div className="mx-3 mt-3">
+              <EvaluatorPausedCallout
+                projectId={projectId}
+                evalConfig={existingEvaluator}
+                blockedAt={existingEvaluator.blockedAt}
+                allowReactivation
+              />
+            </div>
+          )}
           <EvalLogTable
             projectId={projectId}
             jobConfigurationId={existingEvaluator.id}

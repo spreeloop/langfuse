@@ -1,5 +1,5 @@
 import { Label } from "@/src/components/ui/label";
-import { RadioGroup, RadioGroupItem } from "@/src/components/ui/radio-group";
+import { RadioGroup } from "@/src/components/design-system/RadioGroup/RadioGroup";
 import type { MappingMode } from "../types";
 
 type MappingModeSelectorProps = {
@@ -17,34 +17,34 @@ export function MappingModeSelector({
 }: MappingModeSelectorProps) {
   return (
     <RadioGroup value={value} onValueChange={(v) => onChange(v as MappingMode)}>
-      <div className="flex items-center space-x-3 rounded-md border px-3 hover:bg-muted/50">
-        <RadioGroupItem value="full" id={`${fieldName}-full`} />
+      <div className="hover:bg-muted/50 flex items-center space-x-3 rounded-md border px-3">
+        <RadioGroup.Item value="full" id={`${fieldName}-full`} />
         <Label
           htmlFor={`${fieldName}-full`}
-          className="flex-1 cursor-pointer py-3 text-sm font-medium"
+          className="flex-1 cursor-pointer py-3 text-sm font-bold"
         >
           {fullLabel}
         </Label>
       </div>
-      <div className="flex items-center space-x-3 rounded-md border px-3 hover:bg-muted/50">
-        <RadioGroupItem value="custom" id={`${fieldName}-custom`} />
+      <div className="hover:bg-muted/50 flex items-center space-x-3 rounded-md border px-3">
+        <RadioGroup.Item value="custom" id={`${fieldName}-custom`} />
         <Label
           htmlFor={`${fieldName}-custom`}
-          className="flex-1 cursor-pointer py-3 text-sm font-medium"
+          className="flex-1 cursor-pointer py-3 text-sm font-bold"
         >
           Custom mapping
         </Label>
       </div>
       {fieldName !== "input" && (
-        <div className="flex items-center space-x-3 rounded-md border px-3 hover:bg-muted/50">
-          <RadioGroupItem
+        <div className="hover:bg-muted/50 flex items-center space-x-3 rounded-md border px-3">
+          <RadioGroup.Item
             value="none"
             id={`${fieldName}-none`}
             disabled={fieldName === "input"}
           />
           <Label
             htmlFor={`${fieldName}-none`}
-            className="flex-1 cursor-pointer py-3 text-sm font-medium"
+            className="flex-1 cursor-pointer py-3 text-sm font-bold"
           >
             None
           </Label>

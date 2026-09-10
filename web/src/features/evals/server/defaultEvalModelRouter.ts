@@ -1,11 +1,19 @@
-import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
+import { throwIfNoProjectAccess } from "@/src/features/rbac";
 import {
   createTRPCRouter,
   protectedProjectProcedure,
 } from "@/src/server/api/trpc";
-import { z } from "zod/v4";
-import { ZodModelConfig } from "@langfuse/shared";
-import { DefaultEvalModelService } from "@langfuse/shared/src/server";
+import { z } from "zod";
+
+import { EvaluatorBlockReason, ZodModelConfig } from "@langfuse/shared";
+import {
+  blockEvaluatorsUsingDefaultModel,
+  DefaultEvalModelService,
+  EvaluatorBlockSource,
+  finalizeEvaluatorBlocks,
+  invalidateProjectEvalConfigCaches,
+  unblockEvaluatorsUsingDefaultModel,
+} from "@langfuse/shared/src/server";
 
 export const defaultEvalModelRouter = createTRPCRouter({
   fetchDefaultModel: protectedProjectProcedure
@@ -36,7 +44,20 @@ export const defaultEvalModelRouter = createTRPCRouter({
         scope: "evalDefaultModel:CUD",
       });
 
-      return DefaultEvalModelService.upsertDefaultModel(input);
+      const defaultModel =
+        await DefaultEvalModelService.upsertDefaultModel(input);
+      const unblocked = await ctx.prisma.$transaction((tx) =>
+        unblockEvaluatorsUsingDefaultModel({
+          tx,
+          projectId: input.projectId,
+        }),
+      );
+
+      if (unblocked.unblockedEvaluatorCount > 0) {
+        await invalidateProjectEvalConfigCaches(input.projectId);
+      }
+
+      return defaultModel;
     }),
   deleteDefaultModel: protectedProjectProcedure
     .input(z.object({ projectId: z.string() }))
@@ -47,24 +68,10 @@ export const defaultEvalModelRouter = createTRPCRouter({
         scope: "evalDefaultModel:CUD",
       });
 
-      // Invalidate all eval jobs that rely on the default model
-      return ctx.prisma.$transaction(async (tx) => {
-        const evalTemplates = await tx.evalTemplate.findMany({
-          where: {
-            OR: [{ projectId: input.projectId }, { projectId: null }],
-            provider: null,
-            model: null,
-          },
-        });
-
-        await tx.jobConfiguration.updateMany({
-          where: {
-            evalTemplateId: { in: evalTemplates.map((et) => et.id) },
-            projectId: input.projectId,
-          },
-          data: {
-            status: "INACTIVE",
-          },
+      const result = await ctx.prisma.$transaction(async (tx) => {
+        const blockResult = await blockEvaluatorsUsingDefaultModel({
+          tx,
+          projectId: input.projectId,
         });
 
         // Delete the default model within the transaction
@@ -75,7 +82,18 @@ export const defaultEvalModelRouter = createTRPCRouter({
           },
         });
 
-        return { success: true };
+        return blockResult;
       });
+
+      await finalizeEvaluatorBlocks({
+        projectId: input.projectId,
+        source: EvaluatorBlockSource.DEFAULT_EVAL_MODEL_DELETION,
+        evaluatorIdsByReason: {
+          [EvaluatorBlockReason.DEFAULT_EVAL_MODEL_MISSING]:
+            result.blockedEvaluatorIds,
+        },
+      });
+
+      return { success: true };
     }),
 });

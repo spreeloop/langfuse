@@ -1,5 +1,6 @@
+/* eslint-disable @repo/no-style-props */
 import { Button } from "@/src/components/ui/button";
-import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
+import { useHasProjectAccess } from "@/src/features/rbac";
 import { api } from "@/src/utils/api";
 import { cn } from "@/src/utils/tailwind";
 import { Check, Pencil, TriangleAlert } from "lucide-react";
@@ -13,7 +14,7 @@ export function ManageDefaultEvalModel({
   className,
 }: {
   projectId: string;
-  setUpMessage?: string;
+  setUpMessage?: React.ReactNode;
   variant?: "default" | "color-coded";
   showEditButton?: boolean;
   className?: string;
@@ -36,25 +37,25 @@ export function ManageDefaultEvalModel({
     <div className="flex items-center">
       {!showEditButton &&
         (defaultModel ? (
-          <Check className="mr-2 h-4 w-4 text-dark-green" />
+          <Check className="text-dark-green mr-2 h-4 w-4" />
         ) : (
-          <TriangleAlert className="mr-2 h-4 w-4 text-dark-yellow" />
+          <TriangleAlert className="text-dark-yellow mr-2 h-4 w-4" />
         ))}
       {defaultModel ? (
         <span
           className={cn(
-            "text-sm font-medium",
+            "text-sm font-bold text-nowrap",
             variant === "color-coded" && "text-dark-green",
             className,
           )}
         >
-          {"Current default model: "}
+          {"Default model: "}
           {defaultModel.provider} / {defaultModel.model}
         </span>
       ) : (
         <span
           className={cn(
-            "text-sm font-medium",
+            "text-sm font-bold",
             variant === "color-coded" && "text-dark-yellow",
             className,
           )}

@@ -3,27 +3,33 @@ FROM --platform=${TARGETPLATFORM:-linux/amd64} node:24-alpine AS alpine
 
 # It's important to update the index before installing packages to ensure you're getting the latest versions.
 # Check https://github.com/nodejs/docker-node/tree/b4117f9333da4138b03a546ec926ef50a31506c3#nodealpine to understand why libc6-compat might be needed.
-RUN apk update && apk upgrade --no-cache libcrypto3 libssl3 libc6-compat busybox ssl_client
+RUN apk update && apk upgrade --no-cache libcrypto3 libssl3 libc6-compat busybox ssl_client zlib
 
-FROM --platform=${TARGETPLATFORM:-linux/amd64} alpine AS base
+FROM --platform=${TARGETPLATFORM:-linux/amd64} alpine AS build-base
 # Pin turbo to avoid nondeterministic prune output from future patch releases.
-RUN npm install turbo@2.8.10 --global
+RUN npm install turbo@2.10.5 --global
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable
-RUN corepack prepare pnpm@9.5.0 --activate
+# Pass --build-arg NODE_USE_ENV_PROXY=1 when building behind a proxy.
+ARG NODE_USE_ENV_PROXY
+RUN npm install --global corepack@0.36.0 \
+    && corepack enable \
+    && corepack prepare pnpm@12.3.1 --activate
 
+FROM --platform=${TARGETPLATFORM:-linux/amd64} alpine AS runtime-base
+# package managers and build-only CLIs only increase exposure to CVEs -> remove them
+RUN rm -rf /usr/local/lib/node_modules/corepack /usr/local/lib/node_modules/npm \
+            /root/.cache/node/corepack && \
+    rm -f /usr/local/bin/corepack /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/yarn /usr/local/bin/yarnpkg
 
-FROM --platform=${TARGETPLATFORM:-linux/amd64} base AS pruner
+FROM --platform=${TARGETPLATFORM:-linux/amd64} build-base AS pruner
 
 WORKDIR /app
 
 COPY . .
 RUN turbo prune --scope=worker --docker
 
-
-
-FROM --platform=${TARGETPLATFORM:-linux/amd64} base AS builder
+FROM --platform=${TARGETPLATFORM:-linux/amd64} build-base AS builder
 
 WORKDIR /app
 
@@ -33,6 +39,13 @@ COPY --from=pruner /app/out/pnpm-workspace.yaml ./pnpm-workspace.yaml
 COPY --from=pruner /app/out/json/ .
 
 RUN pnpm install --frozen-lockfile
+
+# pnpm can verify dependencies before each `pnpm run`, so every command
+# spawned by turbo re-checks node_modules via file mtimes. Cached install
+# layers make those mtimes look stale, and the concurrent auto-installs race
+# in the hoisting step (ENOENT unlink in node_modules/.pnpm/node_modules).
+# The frozen-lockfile install above is authoritative; skip the check.
+ENV pnpm_config_verify_deps_before_run=false
 
 # pass public variables in build step
 ARG NEXT_PUBLIC_LANGFUSE_CLOUD_REGION
@@ -46,7 +59,23 @@ COPY --from=pruner /app/out/full/ .
 
 RUN turbo run build --filter=worker...
 
-FROM --platform=${TARGETPLATFORM:-linux/amd64} base AS runner
+FROM --platform=${TARGETPLATFORM:-linux/amd64} builder AS prod-deps
+
+# previously we copied the --from=builder /app . (includes full node_modules etc)
+# we only need the prod + generated prisma client plus .prisma artifacts
+# @langfuse/shared still pulls in next-auth transitively, so keep the deploy output
+# intact here instead of pruning node_modules in Docker.
+# pnpm deploy materializes linked workspace packages into the standalone artifact.
+RUN pnpm --filter worker deploy --prod /prod/worker && \
+    builder_prisma_client_dir="$(find /app/node_modules/.pnpm -path '*/node_modules/@prisma/client' -type d | head -n 1)" && \
+    deployed_prisma_client_dir="$(find /prod/worker/node_modules/.pnpm -path '*/node_modules/@prisma/client' -type d | head -n 1)" && \
+    builder_prisma_runtime_dir="$(dirname "$(dirname "$builder_prisma_client_dir")")/.prisma" && \
+    deployed_prisma_runtime_dir="$(dirname "$(dirname "$deployed_prisma_client_dir")")/.prisma" && \
+    rm -rf "$deployed_prisma_client_dir" "$deployed_prisma_runtime_dir" && \
+    cp -R "$builder_prisma_client_dir" "$deployed_prisma_client_dir" && \
+    cp -R "$builder_prisma_runtime_dir" "$deployed_prisma_runtime_dir"
+
+FROM --platform=${TARGETPLATFORM:-linux/amd64} runtime-base AS runner
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
@@ -66,10 +95,11 @@ ARG UID=1001
 ARG GID=1001
 RUN addgroup --system --gid ${GID} expressjs
 RUN adduser --system --uid ${UID} expressjs
-USER expressjs
-COPY --from=builder --chown=expressjs:expressjs /app .
-COPY --chown=expressjs:expressjs ./worker/entrypoint.sh ./worker/entrypoint.sh
+
+# Copy only production worker payload instead of full builder workspace (just /prod/worker not entire /app)
+COPY --from=prod-deps --chown=expressjs:expressjs /prod/worker ./worker
 RUN chmod +x ./worker/entrypoint.sh
+USER expressjs
 
 EXPOSE 3030
 ENV PORT=3030

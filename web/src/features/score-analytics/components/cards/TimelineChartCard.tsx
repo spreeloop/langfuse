@@ -6,8 +6,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/src/components/ui/card";
-import { Tabs, TabsList, TabsTrigger } from "@/src/components/ui/tabs";
-import { Loader2 } from "lucide-react";
+import { Tabs } from "@/src/components/design-system/Tabs/Tabs";
 import { useScoreAnalytics } from "../ScoreAnalyticsProvider";
 import { ScoreTimeSeriesChart } from "../charts/ScoreTimeSeriesChart";
 import { SamplingDetailsHoverCard } from "../SamplingDetailsHoverCard";
@@ -15,6 +14,7 @@ import {
   getScoreCategoryColors,
   getScoreBooleanColors,
 } from "@/src/features/score-analytics/lib/color-scales";
+import Spinner from "@/src/components/design-system/Spinner/Spinner";
 
 type TimelineTab = "score1" | "score2" | "all" | "matched";
 
@@ -212,7 +212,7 @@ export function TimelineChartCard() {
           <CardDescription>Loading chart...</CardDescription>
         </CardHeader>
         <CardContent className="flex h-[340px] grow items-center justify-center">
-          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+          <Spinner size="xl" variant="muted" />
         </CardContent>
       </Card>
     );
@@ -226,7 +226,7 @@ export function TimelineChartCard() {
           <CardTitle>Trend Over Time</CardTitle>
           <CardDescription>No data available</CardDescription>
         </CardHeader>
-        <CardContent className="flex h-[340px] items-center justify-center text-sm text-muted-foreground">
+        <CardContent className="text-muted-foreground flex h-[340px] items-center justify-center text-sm">
           Select a score to view trends
         </CardContent>
       </Card>
@@ -245,12 +245,6 @@ export function TimelineChartCard() {
 
   const hasData = chartData.length > 0;
   const showTabs = mode === "two";
-
-  // Helper function to truncate tab labels with max character limit
-  const truncateLabel = (label: string): string => {
-    if (label.length <= 20) return label;
-    return label.substring(0, 17) + "...";
-  };
 
   // Build full tab labels for title attribute (hover tooltip)
   const score1FullLabel =
@@ -287,28 +281,20 @@ export function TimelineChartCard() {
               value={activeTab}
               onValueChange={(v) => setActiveTab(v as TimelineTab)}
             >
-              <TabsList className="h-7">
-                <TabsTrigger
+              <Tabs.List size="md">
+                <Tabs.Trigger
                   value="score1"
-                  title={score1FullLabel}
-                  className="h-5 px-2 text-xs"
-                >
-                  {truncateLabel(score1FullLabel)}
-                </TabsTrigger>
-                <TabsTrigger
+                  size="sm"
+                  label={score1FullLabel}
+                />
+                <Tabs.Trigger
                   value="score2"
-                  title={score2FullLabel}
-                  className="h-5 px-2 text-xs"
-                >
-                  {truncateLabel(score2FullLabel)}
-                </TabsTrigger>
-                <TabsTrigger value="all" className="h-5 px-2 text-xs">
-                  all
-                </TabsTrigger>
-                <TabsTrigger value="matched" className="h-5 px-2 text-xs">
-                  matched
-                </TabsTrigger>
-              </TabsList>
+                  size="sm"
+                  label={score2FullLabel}
+                />
+                <Tabs.Trigger value="all" size="sm" label="all" />
+                <Tabs.Trigger value="matched" size="sm" label="matched" />
+              </Tabs.List>
             </Tabs>
           )}
         </div>
@@ -337,7 +323,7 @@ export function TimelineChartCard() {
             colors={chartColors}
           />
         ) : (
-          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+          <div className="text-muted-foreground flex h-full items-center justify-center text-sm">
             No time series data available for the selected time range
           </div>
         )}

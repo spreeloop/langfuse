@@ -9,7 +9,7 @@ import {
   type DatasetRunItemDomain,
   AGGREGATABLE_SCORE_TYPES,
 } from "@langfuse/shared";
-import { z } from "zod/v4";
+import { z } from "zod";
 import {
   type EnrichedDatasetRunItem,
   getLatencyAndTotalCostForObservationsByTraces,
@@ -37,11 +37,6 @@ export const datasetRunTableMetricsSchema = z.object({
   runIds: z.array(z.string()),
   filter: z.array(singleFilter),
 });
-
-export type DatasetRunsTableInput = z.infer<typeof datasetRunsTableSchema>;
-export type DatasetRunTableMetricsInput = z.infer<
-  typeof datasetRunTableMetricsSchema
->;
 
 export type DatasetRunItemsTableInput = {
   projectId: string;

@@ -1,10 +1,11 @@
+/* eslint-disable @repo/no-abstracted-overlay-trigger */
 import { PagedSettingsContainer } from "@/src/components/PagedSettingsContainer";
 import Header from "@/src/components/layouts/header";
 import { Card } from "@/src/components/ui/card";
 import { Button } from "@/src/components/ui/button";
 import { Input } from "@/src/components/ui/input";
-import { api } from "@/src/utils/api";
-import * as z from "zod/v4";
+import { api, reportNonTrpcError } from "@/src/utils/api";
+import * as z from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import {
@@ -24,7 +25,8 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/src/components/ui/dialog";
-import { useSession, signOut } from "next-auth/react";
+import { useSession } from "next-auth/react";
+import { signOutCleanly } from "@/src/features/auth/lib/signOut";
 import { SettingsDangerZone } from "@/src/components/SettingsDangerZone";
 import ContainerPage from "@/src/components/layouts/container-page";
 import { useRouter } from "next/router";
@@ -32,7 +34,7 @@ import { StringNoHTML } from "@langfuse/shared";
 import Link from "next/link";
 import { showSuccessToast } from "@/src/features/notifications/showSuccessToast";
 import { showErrorToast } from "@/src/features/notifications/showErrorToast";
-import { env } from "@/src/env.mjs";
+import { useV4UpgradeUiFlag } from "@/src/features/v4-migration/useV4UpgradeUiEnabled";
 
 const displayNameSchema = z.object({
   name: StringNoHTML.min(1, "Name cannot be empty").max(
@@ -74,14 +76,14 @@ function UpdateDisplayName() {
       <Header title="Display Name" />
       <Card className="p-3">
         {form.getValues().name !== "" ? (
-          <p className="mb-4 text-sm text-primary">
+          <p className="text-primary mb-4 text-sm">
             Your display name will be updated from &quot;
             {session?.user?.name ?? ""}
             &quot; to &quot;
             <b>{form.watch().name}</b>&quot;.
           </p>
         ) : (
-          <p className="mb-4 text-sm text-primary">
+          <p className="text-primary mb-4 text-sm">
             Your display name is currently &quot;
             <b>{session?.user?.name ?? ""}</b>
             &quot;.
@@ -153,9 +155,9 @@ function DeleteAccountButton() {
         description: "Your account has been successfully deleted.",
       });
       await new Promise((resolve) => setTimeout(resolve, 2000));
-      await signOut();
+      await signOutCleanly();
     } catch (error) {
-      console.error(error);
+      reportNonTrpcError(error, "account");
       showErrorToast(
         "Failed to Delete Account",
         error instanceof Error ? error.message : "An unexpected error occurred",
@@ -170,7 +172,7 @@ function DeleteAccountButton() {
       </DialogTrigger>
       <DialogContent className="sm:max-w-[425px]">
         <DialogHeader>
-          <DialogTitle className="text-lg font-semibold">
+          <DialogTitle className="text-lg font-bold">
             Delete Account
           </DialogTitle>
           <DialogDescription>
@@ -185,7 +187,7 @@ function DeleteAccountButton() {
                     <li key={org.id}>
                       <Link
                         href={`/organization/${org.id}/settings`}
-                        className="font-semibold text-primary underline hover:text-primary/80"
+                        className="text-primary hover:text-primary/80 font-bold underline"
                       >
                         {org.name}
                       </Link>
@@ -241,18 +243,25 @@ function DeleteAccountButton() {
 type AccountSettingsPage = {
   title: string;
   slug: string;
-  content: React.ReactNode;
+  show?: boolean | (() => boolean);
   cmdKKeywords?: string[];
-};
+} & ({ content: React.ReactNode } | { href: string });
 
 export function useAccountSettingsPages(): AccountSettingsPage[] {
   const { data: session } = useSession();
   const userEmail = session?.user?.email ?? "";
+  const showV4Migration = useV4UpgradeUiFlag();
 
-  return getAccountSettingsPages(userEmail);
+  return getAccountSettingsPages({ userEmail, showV4Migration });
 }
 
-const getAccountSettingsPages = (userEmail: string): AccountSettingsPage[] => [
+const getAccountSettingsPages = ({
+  userEmail,
+  showV4Migration,
+}: {
+  userEmail: string;
+  showV4Migration: boolean;
+}): AccountSettingsPage[] => [
   {
     title: "General",
     slug: "index",
@@ -272,7 +281,7 @@ const getAccountSettingsPages = (userEmail: string): AccountSettingsPage[] => [
         <div>
           <Header title="Email" />
           <Card className="p-3">
-            <p className="text-sm text-primary">
+            <p className="text-primary text-sm">
               Your email address: <b>{userEmail}</b>
             </p>
           </Card>
@@ -281,17 +290,12 @@ const getAccountSettingsPages = (userEmail: string): AccountSettingsPage[] => [
         <div>
           <Header title="Password" />
           <Card className="p-3">
-            <p className="mb-4 text-sm text-primary">
-              To change your password, we will send you a secure link to your
-              email address. Click the button below to start the password reset
-              process.
+            <p className="text-primary mb-4 text-sm">
+              To change your password, we will email a one-time code to your
+              address. Enter the code together with your new password.
             </p>
             <Button asChild variant="secondary">
-              <Link
-                href={`${env.NEXT_PUBLIC_BASE_PATH ?? ""}/auth/reset-password`}
-              >
-                Change Password
-              </Link>
+              <Link href="/auth/reset-password">Change Password</Link>
             </Button>
           </Card>
         </div>
@@ -308,14 +312,17 @@ const getAccountSettingsPages = (userEmail: string): AccountSettingsPage[] => [
       </div>
     ),
   },
+  {
+    title: "v4 Migration",
+    slug: "v4-migration",
+    href: "/v4-migration",
+    show: showV4Migration,
+  },
 ];
 
 export default function AccountSettingsPage() {
-  const { data: session } = useSession();
   const router = useRouter();
-  const userEmail = session?.user?.email ?? "";
-
-  const pages = getAccountSettingsPages(userEmail);
+  const pages = useAccountSettingsPages();
 
   return (
     <ContainerPage

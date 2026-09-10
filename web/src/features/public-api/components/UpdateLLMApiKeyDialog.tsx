@@ -1,3 +1,4 @@
+/* eslint-disable @repo/no-abstracted-overlay-trigger, @repo/no-null-render */
 import { useState } from "react";
 import { Button } from "@/src/components/ui/button";
 import {
@@ -9,9 +10,11 @@ import {
 } from "@/src/components/ui/dialog";
 import { CreateLLMApiKeyForm } from "./CreateLLMApiKeyForm";
 import { useUiCustomization } from "@/src/ee/features/ui-customization/useUiCustomization";
-import { type LlmApiKeys } from "@langfuse/shared";
-import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
+import { useHasProjectAccess } from "@/src/features/rbac";
 import { PencilIcon } from "lucide-react";
+import { type RouterOutputs } from "@/src/utils/api";
+
+type LlmApiKeyListItem = RouterOutputs["llmApiKey"]["all"]["data"][number];
 
 export function UpdateLLMApiKeyDialog({
   apiKey,
@@ -19,7 +22,7 @@ export function UpdateLLMApiKeyDialog({
   open,
   onOpenChange,
 }: {
-  apiKey: LlmApiKeys;
+  apiKey: LlmApiKeyListItem;
   projectId: string;
   open?: boolean;
   onOpenChange?: (open: boolean) => void;

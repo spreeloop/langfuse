@@ -1,12 +1,13 @@
 import { useCallback } from "react";
 import { ExternalLink } from "lucide-react";
-import { ScoreCombobox } from "./charts/ScoreCombobox";
+import { ScoreCombobox, type ScoreOption } from "./charts/ScoreCombobox";
 import { ObjectTypeFilter } from "./charts/ObjectTypeFilter";
 import { TimeRangePicker } from "@/src/components/date-picker";
-import { DASHBOARD_AGGREGATION_OPTIONS } from "@/src/utils/date-range-utils";
+import {
+  DASHBOARD_AGGREGATION_OPTIONS,
+  type TimeRange,
+} from "@/src/utils/date-range-utils";
 import { useAnalyticsUrlState } from "@/src/features/score-analytics/lib/analytics-url-state";
-import { type TimeRange } from "@/src/utils/date-range-utils";
-import { type ScoreOption } from "./charts/ScoreCombobox";
 import { Badge } from "@/src/components/ui/badge";
 import {
   HoverCard,
@@ -60,7 +61,7 @@ export function ScoreAnalyticsHeader({
   );
 
   return (
-    <div className="flex flex-col gap-1 border-b border-border p-2 lg:flex-row lg:items-center lg:gap-4">
+    <div className="border-border flex flex-col gap-1 border-b p-2 lg:flex-row lg:items-center lg:gap-4">
       {/* Left: Score Selectors */}
       <div className="flex items-center gap-2">
         <ScoreCombobox
@@ -87,8 +88,8 @@ export function ScoreAnalyticsHeader({
           </HoverCardTrigger>
           <HoverCardContent className="w-80">
             <div className="space-y-2">
-              <h4 className="text-sm font-semibold">Beta Feature</h4>
-              <p className="text-sm text-muted-foreground">
+              <h4 className="text-sm font-bold">Beta Feature</h4>
+              <p className="text-muted-foreground text-sm">
                 Score analytics is currently in beta. We&apos;re actively
                 improving this feature and would love to hear your feedback.
               </p>
@@ -96,7 +97,7 @@ export function ScoreAnalyticsHeader({
                 href="https://langfuse.com/discussions"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
+                className="text-primary inline-flex items-center gap-1 text-sm font-bold hover:underline"
               >
                 Share feedback on GitHub Discussions
                 <ExternalLink className="h-3 w-3" />

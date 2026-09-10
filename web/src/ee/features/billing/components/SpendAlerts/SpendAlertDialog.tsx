@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import * as z from "zod/v4";
+import * as z from "zod";
 import {
   Dialog,
   DialogContent,
@@ -18,8 +18,8 @@ import {
 } from "@/src/components/ui/form";
 import { Input } from "@/src/components/ui/input";
 import { Button } from "@/src/components/ui/button";
-import { api } from "@/src/utils/api";
-import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
+import { api, reportNonTrpcError } from "@/src/utils/api";
+import { usePostHogClientCapture } from "@/src/features/posthog-analytics";
 import { toast } from "sonner";
 import { Info } from "lucide-react";
 
@@ -102,7 +102,7 @@ export function SpendAlertDialog({
       }
       onSuccess();
     } catch (error) {
-      console.error("Failed to save spend alert:", error);
+      reportNonTrpcError(error, "billing");
       toast.error(
         `Failed to ${alert ? "update" : "create"} spend alert. Please try again.`,
       );
@@ -117,7 +117,7 @@ export function SpendAlertDialog({
         <DialogTitle>
           {alert ? "Edit Spend Alert" : "Create Spend Alert"}
         </DialogTitle>
-        <DialogDescription className="pb-2 pt-1 text-sm text-muted-foreground">
+        <DialogDescription className="text-muted-foreground pt-1 pb-2 text-sm">
           Get notified when your organization&apos;s spending exceeds a limit.
         </DialogDescription>
         <Form {...form}>
@@ -164,10 +164,10 @@ export function SpendAlertDialog({
                 </FormItem>
               )}
             />
-            <div className="text-xs text-muted-foreground">
+            <div className="text-muted-foreground text-xs">
               <div className="flex flex-row items-center">
                 <Info className="mr-2 h-3 w-3" />
-                <span className="font-medium">How it works</span>
+                <span className="font-bold">How it works</span>
               </div>
               <ul className="list-disc pl-5">
                 <li>

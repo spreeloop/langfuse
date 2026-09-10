@@ -1,5 +1,5 @@
 import { type GetServerSideProps } from "next";
-import { LangfuseIcon } from "@/src/components/LangfuseLogo";
+import { LangfuseIcon } from "@/src/components/design-system/LangfuseIcon/LangfuseIcon";
 import { Button } from "@/src/components/ui/button";
 import {
   Form,
@@ -25,28 +25,43 @@ import {
   SiWordpress,
 } from "react-icons/si";
 import { TbBrandAzure, TbBrandOauth } from "react-icons/tb";
-import { signIn } from "next-auth/react";
+import { signIn, useSession } from "next-auth/react";
 import Head from "next/head";
 import Link from "next/link";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useForm } from "react-hook-form";
-import * as z from "zod/v4";
+import * as z from "zod";
 import { CloudPrivacyNotice } from "@/src/features/auth/components/AuthCloudPrivacyNotice";
 import { CloudRegionSwitch } from "@/src/features/auth/components/AuthCloudRegionSwitch";
-import { PasswordInput } from "@/src/components/ui/password-input";
+import { PasswordInput } from "@/src/components/design-system/PasswordInput/PasswordInput";
 import { isAnySsoConfigured } from "@/src/ee/features/multi-tenant-sso/utils";
+import { isEmailVerificationRequired } from "@/src/features/auth-credentials/lib/credentialsUtils";
 import { Code, Key } from "lucide-react";
 import { useRouter } from "next/router";
-import { captureException } from "@sentry/nextjs";
+import { reportError } from "@/src/utils/reportError";
+import {
+  isExpectedSignInError,
+  isNextAuthMissingSignInUrlError,
+  isJsonParseSyntaxError,
+} from "@/src/features/auth/lib/expectedAuthErrors";
+import { captureUnknownError } from "@/src/utils/captureUnknownError";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 import useLocalStorage from "@/src/components/useLocalStorage";
 import { AuthProviderButton } from "@/src/features/auth/components/AuthProviderButton";
 import { cn } from "@/src/utils/tailwind";
 import { useLangfuseCloudRegion } from "@/src/features/organizations/hooks";
 import { getSafeRedirectPath } from "@/src/utils/redirect";
+import { Spinner } from "@/src/components/layouts/spinner";
+
+// The shared, intentionally-public demo identity created by the seed script
+// (packages/shared/scripts/seeder/seed-postgres.ts) and posted in every
+// preview PR comment (.github/workflows/preview-build.yml). Only used when
+// NEXT_PUBLIC_PREVIEW_DEMO_AUTO_SIGN_IN is baked into the build.
+const PREVIEW_DEMO_USER_EMAIL = "demo@langfuse.com";
+const PREVIEW_DEMO_USER_PASSWORD = "password";
 
 const credentialAuthForm = z.object({
-  email: z.string().email(),
+  email: z.email(),
   password: z.string().min(8, {
     message: "Password must be at least 8 characters long",
   }),
@@ -67,6 +82,7 @@ export type PageProps = {
     auth0: boolean;
     clickhouseCloud: boolean;
     cognito: boolean;
+    jumpcloud: boolean;
     keycloak:
       | {
           name: string;
@@ -90,6 +106,7 @@ export type PageProps = {
   };
   runningOnHuggingFaceSpaces: boolean;
   signUpDisabled: boolean;
+  emailVerificationRequired: boolean;
 };
 
 // Also used in src/pages/auth/sign-up.tsx
@@ -143,6 +160,10 @@ export const getServerSideProps: GetServerSideProps<PageProps> = async () => {
           env.AUTH_COGNITO_CLIENT_ID !== undefined &&
           env.AUTH_COGNITO_CLIENT_SECRET !== undefined &&
           env.AUTH_COGNITO_ISSUER !== undefined,
+        jumpcloud:
+          env.AUTH_JUMPCLOUD_CLIENT_ID !== undefined &&
+          env.AUTH_JUMPCLOUD_CLIENT_SECRET !== undefined &&
+          env.AUTH_JUMPCLOUD_ISSUER !== undefined,
         keycloak:
           env.AUTH_KEYCLOAK_CLIENT_ID !== undefined &&
           env.AUTH_KEYCLOAK_CLIENT_SECRET !== undefined &&
@@ -173,12 +194,38 @@ export const getServerSideProps: GetServerSideProps<PageProps> = async () => {
         sso,
       },
       signUpDisabled: env.AUTH_DISABLE_SIGNUP === "true",
+      emailVerificationRequired: isEmailVerificationRequired(),
       runningOnHuggingFaceSpaces: env.NEXTAUTH_URL?.replace(
         "/api/auth",
         "",
       ).endsWith(".hf.space"),
     },
   };
+};
+
+// A client-side navigation whose props fetch fails (e.g. deploy skew) can
+// mount the page with empty props despite the PageProps contract — fall back
+// to "no providers" instead of crashing on `authProviders.sso`.
+// Also used in src/pages/auth/sign-up.tsx
+export const FALLBACK_AUTH_PROVIDERS: PageProps["authProviders"] = {
+  credentials: false,
+  google: false,
+  github: false,
+  githubEnterprise: false,
+  gitlab: false,
+  okta: false,
+  authentik: false,
+  onelogin: false,
+  azureAd: false,
+  auth0: false,
+  clickhouseCloud: false,
+  cognito: false,
+  jumpcloud: false,
+  keycloak: false,
+  workos: false,
+  wordpress: false,
+  custom: false,
+  sso: false,
 };
 
 type NextAuthProvider = NonNullable<Parameters<typeof signIn>[0]>;
@@ -217,7 +264,7 @@ export function SSOButtons({
         // do not reset loadingProvider here, as the page will reload
       })
       .catch((error) => {
-        console.error(error);
+        captureUnknownError("auth.signIn.provider", error, { provider });
         setProviderSigningIn(null);
       });
   };
@@ -233,9 +280,9 @@ export function SSOButtons({
       <div>
         {showSeparator ? (
           action === "sign in" ? (
-            <div className="my-6 border-t border-border"></div>
+            <div className="border-border my-6 border-t"></div>
           ) : (
-            <div className="my-6 text-center text-xs text-muted-foreground">
+            <div className="text-muted-foreground my-6 text-center text-xs">
               or {action} with
             </div>
           )
@@ -362,6 +409,17 @@ export function SSOButtons({
               }
             />
           )}
+          {authProviders.jumpcloud && (
+            <AuthProviderButton
+              icon={<TbBrandOauth className="mr-3" size={18} />}
+              label="JumpCloud"
+              onClick={() => handleSignIn("jumpcloud")}
+              loading={providerSigningIn === "jumpcloud"}
+              showLastUsedBadge={
+                hasMultipleAuthMethods && lastUsedMethod === "jumpcloud"
+              }
+            />
+          )}
           {authProviders.keycloak && (
             <AuthProviderButton
               icon={<SiKeycloak className="mr-3" size={18} />}
@@ -373,7 +431,7 @@ export function SSOButtons({
               onClick={() => {
                 capture("sign_in:button_click", { provider: "keycloak" });
                 onProviderSelect?.("keycloak");
-                void signIn("keycloak");
+                signIn("keycloak");
               }}
               loading={providerSigningIn === "keycloak"}
               showLastUsedBadge={
@@ -389,7 +447,7 @@ export function SSOButtons({
                 onClick={() => {
                   capture("sign_in:button_click", { provider: "workos" });
                   onProviderSelect?.("workos");
-                  void signIn("workos", undefined, {
+                  signIn("workos", undefined, {
                     connection: (
                       authProviders.workos as { connectionId: string }
                     ).connectionId,
@@ -409,7 +467,7 @@ export function SSOButtons({
                 onClick={() => {
                   capture("sign_in:button_click", { provider: "workos" });
                   onProviderSelect?.("workos");
-                  void signIn("workos", undefined, {
+                  signIn("workos", undefined, {
                     organization: (
                       authProviders.workos as { organizationId: string }
                     ).organizationId,
@@ -433,7 +491,7 @@ export function SSOButtons({
                   if (organization) {
                     capture("sign_in:button_click", { provider: "workos" });
                     onProviderSelect?.("workos");
-                    void signIn("workos", undefined, {
+                    signIn("workos", undefined, {
                       organization,
                     });
                   }
@@ -453,7 +511,7 @@ export function SSOButtons({
                   if (connection) {
                     capture("sign_in:button_click", { provider: "workos" });
                     onProviderSelect?.("workos");
-                    void signIn("workos", undefined, {
+                    signIn("workos", undefined, {
                       connection,
                     });
                   }
@@ -515,7 +573,7 @@ export function useHuggingFaceRedirect(runningOnHuggingFaceSpaces: boolean) {
       typeof window !== "undefined" &&
       isInIframe()
     ) {
-      void router.push("/auth/hf-spaces");
+      router.push("/auth/hf-spaces");
     }
   }, [router, runningOnHuggingFaceSpaces]);
 }
@@ -529,7 +587,7 @@ const signInErrors = [
 ];
 
 export default function SignIn({
-  authProviders,
+  authProviders = FALLBACK_AUTH_PROVIDERS,
   signUpDisabled,
   runningOnHuggingFaceSpaces,
 }: PageProps) {
@@ -553,15 +611,20 @@ export default function SignIn({
       nextAuthError);
 
   useEffect(() => {
-    // log unexpected sign in errors to Sentry
-    // An error is unexpected if it's not in our mapped errors and has no IdP error_description
-    if (
-      nextAuthError &&
-      !nextAuthErrorDescription &&
-      !signInErrors.find((e) => e.code === nextAuthError)
-    ) {
-      captureException(new Error(`Sign in error: ${nextAuthError}`));
-    }
+    if (!nextAuthError) return;
+    // Expected = user-caused or provider-transient outcomes the form already
+    // renders: mapped codes, allowlisted codes (expectedAuthErrors.ts), and
+    // IdP-described errors. They breadcrumb instead of capturing; anything
+    // else (unknown codes, misconfig codes) is a real Sentry error.
+    const expected =
+      Boolean(nextAuthErrorDescription) ||
+      signInErrors.some((e) => e.code === nextAuthError) ||
+      isExpectedSignInError(nextAuthError);
+    reportError(new Error(`Sign in error: ${nextAuthError}`), {
+      area: "auth.signIn",
+      expected,
+      extra: { code: nextAuthError },
+    });
   }, [nextAuthError, nextAuthErrorDescription]);
 
   const [credentialsFormError, setCredentialsFormError] = useState<
@@ -622,14 +685,23 @@ export default function SignIn({
         redirect: false,
       });
       if (result === undefined) {
+        // next-auth's signIn() returns undefined when its providers fetch
+        // failed (network drop, or the auth API unreachable/5xx — a transport
+        // or server state the server owns, not an app failure here). It then
+        // navigates to the error page itself; when the server is up, that
+        // lands on /auth/error?error=undefined, which still captures.
         setCredentialsFormError("An unexpected error occurred.");
-        captureException(new Error("Sign in result is undefined"));
+        reportError(new Error("Sign in result is undefined"), {
+          area: "auth.signIn.credentials",
+          expected: true,
+        });
       } else if (!result.ok) {
         if (!result.error) {
-          captureException(
+          reportError(
             new Error(
               `Sign in result error is falsy, result: ${JSON.stringify(result)}`,
             ),
+            { area: "auth.signIn.credentials" },
           );
         }
         setCredentialsFormError(
@@ -637,11 +709,81 @@ export default function SignIn({
         );
       }
     } catch (error) {
-      captureException(error);
-      console.error(error);
+      if (isNextAuthMissingSignInUrlError(error)) {
+        // next-auth threw on a JSON body with no `url` (see
+        // isNextAuthMissingSignInUrlError). Same class of failure as
+        // signIn() returning undefined — show the form error, don't capture.
+        reportError(error, {
+          area: "auth.signIn.credentials",
+          expected: true,
+        });
+      } else {
+        captureUnknownError("auth.signIn.credentials", error);
+      }
       setCredentialsFormError("An unexpected error occurred.");
     }
   }
+
+  // Auto sign-in for disposable preview deployments: the flag is baked only
+  // into preview images (.github/workflows/preview-build.yml) whose seeded
+  // demo login is shared and public anyway. `?autoSignIn=false` opts out,
+  // e.g. to exercise the regular auth flows on a preview. NextAuth error
+  // redirects land on this page, so an error in the query keeps the form
+  // visible instead of silently signing in over it.
+  const autoSignInParam = router.query.autoSignIn;
+  const autoSignInOptedOut = Array.isArray(autoSignInParam)
+    ? autoSignInParam.includes("false")
+    : autoSignInParam === "false";
+  const previewAutoSignInEnabled =
+    env.NEXT_PUBLIC_PREVIEW_DEMO_AUTO_SIGN_IN === "true" &&
+    authProviders.credentials &&
+    !autoSignInOptedOut &&
+    !nextAuthError;
+  const [previewAutoSignInPending, setPreviewAutoSignInPending] = useState(
+    previewAutoSignInEnabled,
+  );
+  const previewAutoSignInAttempted = useRef(false);
+  const sessionStatus = useSession().status;
+  useEffect(() => {
+    if (
+      !previewAutoSignInEnabled ||
+      previewAutoSignInAttempted.current ||
+      sessionStatus === "loading"
+    )
+      return;
+    previewAutoSignInAttempted.current = true;
+    if (sessionStatus === "authenticated") {
+      // already signed in — useAuthGuard navigates away from this page
+      return;
+    }
+    // re-arm in case the flag flipped enabled after mount (query-only nav)
+    setPreviewAutoSignInPending(true);
+    signIn("credentials", {
+      email: PREVIEW_DEMO_USER_EMAIL,
+      password: PREVIEW_DEMO_USER_PASSWORD,
+      callbackUrl: targetPath ?? "/",
+      redirect: false,
+    })
+      .then((result) => {
+        if (result?.ok) return; // session updates and useAuthGuard navigates
+        setPreviewAutoSignInPending(false);
+        setCredentialsFormError(
+          result?.error ?? "Automatic preview sign-in failed.",
+        );
+      })
+      .catch((error) => {
+        if (isNextAuthMissingSignInUrlError(error)) {
+          reportError(error, {
+            area: "auth.signIn.previewAutoSignIn",
+            expected: true,
+          });
+        } else {
+          captureUnknownError("auth.signIn.previewAutoSignIn", error);
+        }
+        setPreviewAutoSignInPending(false);
+        setCredentialsFormError("Automatic preview sign-in failed.");
+      });
+  }, [previewAutoSignInEnabled, sessionStatus, targetPath]);
 
   /**
    * First-step handler ("Continue" button).
@@ -657,7 +799,7 @@ export default function SignIn({
     credentialsForm.clearErrors();
 
     // Ensure email is valid before hitting the API
-    const emailSchema = z.string().email();
+    const emailSchema = z.email();
     const email = emailSchema.safeParse(credentialsForm.getValues("email"));
     if (!email.success) {
       credentialsForm.setError("email", {
@@ -688,7 +830,7 @@ export default function SignIn({
         // Store the SSO provider as the last used auth method
         setLastUsedAuthMethod(providerId as NextAuthProvider);
 
-        void signIn(providerId);
+        signIn(providerId);
         return; // stop further execution – page redirect expected
       }
 
@@ -707,13 +849,30 @@ export default function SignIn({
         }
       }, 100);
     } catch (error) {
-      console.error(error);
+      // JSON.parse of a non-JSON 200 (proxy/WAF HTML) is transport, not an
+      // app bug — breadcrumb it. Unknown failures still capture.
+      reportError(error, {
+        area: "auth.signIn.checkSso",
+        expected: isJsonParseSyntaxError(error),
+        extra: { context: "auth.signIn.checkSso" },
+      });
       setCredentialsFormError(
         "Unable to check SSO configuration. Please try again.",
       );
     } finally {
       setContinueLoading(false);
     }
+  }
+
+  if (previewAutoSignInEnabled && previewAutoSignInPending) {
+    return (
+      <>
+        <Head>
+          <title>Sign in | Langfuse</title>
+        </Head>
+        <Spinner message={`Signing in as ${PREVIEW_DEMO_USER_EMAIL}`} />
+      </>
+    );
   }
 
   return (
@@ -723,28 +882,30 @@ export default function SignIn({
       </Head>
       <div className="flex flex-1 flex-col py-6 sm:min-h-full sm:justify-center sm:px-6 sm:py-12 lg:px-8">
         <div className="sm:mx-auto sm:w-full sm:max-w-md">
-          <LangfuseIcon className="mx-auto" />
-          <h2 className="mt-4 text-center text-2xl font-bold leading-9 tracking-tight text-primary">
+          <div className="mx-auto w-fit">
+            <LangfuseIcon />
+          </div>
+          <h2 className="text-primary mt-4 text-center text-2xl leading-9 font-bold tracking-tight">
             Sign in to your account
           </h2>
         </div>
 
         {isLangfuseCloud && (
-          <div className="-mb-4 mt-4 rounded-lg bg-card p-3 text-center text-sm sm:mx-auto sm:w-full sm:max-w-[480px] sm:rounded-lg sm:px-6">
+          <div className="bg-card mt-4 -mb-4 rounded-lg p-3 text-center text-sm sm:mx-auto sm:w-full sm:max-w-[480px] sm:rounded-lg sm:px-6">
             If you are experiencing issues signing in, please force refresh this
             page (CMD + SHIFT + R) or clear your browser cache.{" "}
             <a
               href="mailto:support@langfuse.com"
-              className="cursor-pointer whitespace-nowrap text-xs font-medium text-primary-accent hover:text-hover-primary-accent"
+              className="text-link hover:text-link-hover cursor-pointer text-xs font-bold whitespace-nowrap"
             >
               (contact us)
             </a>
           </div>
         )}
 
-        <CloudRegionSwitch />
+        {isLangfuseCloud && <CloudRegionSwitch />}
 
-        <div className="mt-14 bg-background px-6 py-10 shadow sm:mx-auto sm:w-full sm:max-w-[480px] sm:rounded-lg sm:px-10">
+        <div className="bg-background mt-14 px-6 py-10 shadow-sm sm:mx-auto sm:w-full sm:max-w-[480px] sm:rounded-lg sm:px-10">
           <div className="space-y-6">
             {/* Email / (optional) password form – only when credentials auth is enabled */}
             {authProviders.credentials && (
@@ -757,7 +918,7 @@ export default function SignIn({
                         ? credentialsForm.handleSubmit(onCredentialsSubmit)
                         : (e) => {
                             e.preventDefault();
-                            void handleContinue();
+                            handleContinue();
                           }
                     }
                   >
@@ -792,7 +953,7 @@ export default function SignIn({
                               Password{" "}
                               <Link
                                 href="/auth/reset-password"
-                                className="ml-1 text-xs text-primary-accent hover:text-hover-primary-accent"
+                                className="text-link hover:text-link-hover ml-1 text-xs"
                                 tabIndex={-1}
                                 title="What is this?"
                               >
@@ -830,7 +991,7 @@ export default function SignIn({
                 </Form>
                 <div
                   className={cn(
-                    "mt-1 text-center text-xs text-muted-foreground",
+                    "text-muted-foreground mt-1 text-center text-xs",
                     hasMultipleAuthMethods &&
                       lastUsedAuthMethod === "credentials"
                       ? "block"
@@ -842,7 +1003,7 @@ export default function SignIn({
               </div>
             )}
             {credentialsFormError ? (
-              <div className="text-center text-sm font-medium text-destructive">
+              <div className="text-destructive text-center text-sm font-bold">
                 {credentialsFormError}
                 <br />
                 Contact support if this error is unexpected.{" "}
@@ -860,18 +1021,20 @@ export default function SignIn({
           {!signUpDisabled &&
           env.NEXT_PUBLIC_SIGN_UP_DISABLED !== "true" &&
           authProviders.credentials ? (
-            <p className="mt-10 text-center text-sm text-muted-foreground">
+            <p className="text-muted-foreground mt-10 text-center text-sm">
               No account yet?{" "}
               <Link
                 href={`/auth/sign-up${router.asPath.includes("?") ? router.asPath.substring(router.asPath.indexOf("?")) : ""}`}
-                className="font-semibold leading-6 text-primary-accent hover:text-hover-primary-accent"
+                className="text-link hover:text-link-hover leading-6 font-bold"
               >
                 Sign up
               </Link>
             </p>
           ) : null}
         </div>
-        <CloudPrivacyNotice action="signing in" />
+        {env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION !== undefined && (
+          <CloudPrivacyNotice action="signing in" />
+        )}
       </div>
     </>
   );

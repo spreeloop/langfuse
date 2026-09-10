@@ -1,3 +1,12 @@
+import {
+  OBSERVATION_FIELD_GROUPS_PUBLIC_API,
+  type ObservationFieldGroupPublicApi,
+} from "../../../domain/observation-field-groups";
+import {
+  eventsTableIsRootObservationSql,
+  eventsTableTraceNameAggregationSql,
+  eventsTableTraceNameSelectSql,
+} from "../../../eventsTable";
 import { OBSERVATIONS_TO_TRACE_INTERVAL } from "../../repositories/constants";
 import { FilterList, StringFilter } from "./clickhouse-filter";
 
@@ -37,7 +46,10 @@ export interface SplitQueryBuilder extends QueryWithParams {
   leftJoin(cteName: string, alias: string, onClause: string): SplitQueryBuilder;
   select(...expressions: string[]): SplitQueryBuilder;
   orderBy(clause: string): SplitQueryBuilder;
-  orderByColumns(entries: OrderByEntry[]): SplitQueryBuilder;
+  orderByColumns(
+    entries: OrderByEntry[],
+    options?: OrderByColumnsOptions,
+  ): SplitQueryBuilder;
 }
 
 /**
@@ -45,6 +57,51 @@ export interface SplitQueryBuilder extends QueryWithParams {
  */
 export type OrderByDirection = "ASC" | "DESC";
 export type OrderByEntry = { column: string; direction: OrderByDirection };
+type OrderByColumnsOptions = {
+  eventTableAlias?: string;
+  /**
+   * Prepend `<alias>.project_id, toStartOfMinute(<alias>.start_time)` so the
+   * sort matches the events table PRIMARY KEY (project_id,
+   * toStartOfMinute(start_time), xxHash32(trace_id)) for read-in-order.
+   * Callers should set this when the sort order leads with start_time.
+   */
+  matchTablePrimaryKey?: boolean;
+};
+
+const findStartTimeOrderClause = (
+  entries: OrderByEntry[],
+  eventTableAlias: string,
+) =>
+  entries.find(
+    (e) => e.column.replace(/"/g, "") === `${eventTableAlias}.start_time`,
+  );
+
+const buildOrderByClause = (
+  entries: OrderByEntry[],
+  options: OrderByColumnsOptions = {},
+) => {
+  if (!entries.length) {
+    return undefined;
+  }
+
+  const columns: string[] = [];
+  const { eventTableAlias, matchTablePrimaryKey } = options;
+
+  if (matchTablePrimaryKey && eventTableAlias) {
+    // The prefix reuses the direction the caller chose for start_time so the
+    // combined order stays equivalent (toStartOfMinute is monotone).
+    const direction =
+      findStartTimeOrderClause(entries, eventTableAlias)?.direction ?? "DESC";
+    columns.push(
+      `${eventTableAlias}.project_id ${direction}`,
+      `toStartOfMinute(${eventTableAlias}.start_time) ${direction}`,
+    );
+  }
+
+  columns.push(...entries.map((e) => `${e.column} ${e.direction}`));
+
+  return `ORDER BY ${columns.join(", ")}`;
+};
 
 /**
  * Field mapping: each field defined once with its full SELECT expression
@@ -53,6 +110,10 @@ export type OrderByEntry = { column: string; direction: OrderByDirection };
 const EVENTS_FIELDS = {
   // Aggregates
   count: "count(*) as count",
+  // uniq() is the approximate distinct aggregate (HLL-based, bounded memory);
+  // uniqExact would build an unbounded hash set when the filtered set spans
+  // millions of traces.
+  uniqueTraceCount: 'uniq(e.trace_id) as "unique_trace_count"',
 
   // Identity & basic fields
   id: "e.span_id as id",
@@ -61,6 +122,8 @@ const EVENTS_FIELDS = {
   environment: 'e.environment as "environment"',
   type: "e.type as type",
   parentObservationId: 'e.parent_span_id as "parent_observation_id"',
+  isRootObservation: `toBool(${eventsTableIsRootObservationSql}) as "is_root_observation"`,
+  isAppRoot: 'e.is_app_root as "is_app_root"',
   name: "e.name as name",
   level: "e.level as level",
   statusMessage: 'e.status_message as "status_message"',
@@ -69,7 +132,8 @@ const EVENTS_FIELDS = {
   public: "e.public as public",
   userId: 'e.user_id as "user_id"',
   sessionId: 'e.session_id as "session_id"',
-  traceName: 'e.trace_name as "trace_name"',
+  // String-typed on purpose; see eventsTableTraceNameSelectSql (LFE-14924).
+  traceName: `${eventsTableTraceNameSelectSql} as "trace_name"`,
 
   // Time fields
   startTime: 'e.start_time as "start_time"',
@@ -101,16 +165,41 @@ const EVENTS_FIELDS = {
   toolCalls: 'e.tool_calls as "tool_calls"',
   toolCallNames: 'e.tool_call_names as "tool_call_names"',
 
+  // Pricing tier
+  usagePricingTierId: 'e.usage_pricing_tier_id as "usage_pricing_tier_id"',
+  usagePricingTierName:
+    'e.usage_pricing_tier_name as "usage_pricing_tier_name"',
+
   // I/O & metadata fields
   input: "e.input",
   output: "e.output",
-  metadata: "mapFromArrays(e.metadata_names, e.metadata_values) as metadata",
+  metadata:
+    "mapFromArrays(arrayReverse(e.metadata_names), arrayReverse(e.metadata_values)) as metadata",
   // Trace-level denormalized fields
   tags: "e.tags as tags",
   release: "e.release as release",
 
   // Model ID with different alias for exports
   modelId: 'e.model_id as "model_id"',
+
+  // Experiment fields (denormalized on events table)
+  experimentId: 'e.experiment_id as "experiment_id"',
+  experimentName: 'e.experiment_name as "experiment_name"',
+  experimentDescription: 'e.experiment_description as "experiment_description"',
+  experimentDatasetId: 'e.experiment_dataset_id as "experiment_dataset_id"',
+  experimentMetadata:
+    "mapFromArrays(e.experiment_metadata_names, e.experiment_metadata_values) as experiment_metadata",
+
+  // Experiment item fields
+  experimentItemId: 'e.experiment_item_id as "experiment_item_id"',
+  experimentItemRootSpanId:
+    'e.experiment_item_root_span_id as "experiment_item_root_span_id"',
+  experimentItemExpectedOutput:
+    'e.experiment_item_expected_output as "experiment_item_expected_output"',
+  experimentItemMetadata:
+    "mapFromArrays(e.experiment_item_metadata_names, e.experiment_item_metadata_values) as experiment_item_metadata",
+  experimentItemVersion:
+    'e.experiment_item_version as "experiment_item_version"',
 
   // Calculated fields
   latency:
@@ -126,6 +215,7 @@ const EVENTS_FIELDS = {
 const FIELD_SETS = {
   // Aggregates
   count: ["count"],
+  countWithUniqueTraces: ["count", "uniqueTraceCount"],
 
   // List query field sets (for getObservationsWithModelDataFromEventsTable)
   base: [
@@ -144,6 +234,8 @@ const FIELD_SETS = {
     "costDetails",
     "level",
     "environment",
+    "bookmarked",
+    "public",
     "statusMessage",
     "version",
     "parentObservationId",
@@ -151,6 +243,8 @@ const FIELD_SETS = {
     "updatedAt",
     "providedModelName",
     "totalCost",
+    "usagePricingTierId",
+    "usagePricingTierName",
     "promptId",
     "promptName",
     "promptVersion",
@@ -158,16 +252,80 @@ const FIELD_SETS = {
     "userId",
     "sessionId",
     "traceName",
+    "release",
+    "tags",
     "toolDefinitions",
     "toolCalls",
+    "toolCallNames",
+  ],
+  baseWithoutTools: [
+    "id",
+    "type",
+    "projectId",
+    "name",
+    "modelParameters",
+    "startTime",
+    "endTime",
+    "traceId",
+    "completionStartTime",
+    "providedUsageDetails",
+    "usageDetails",
+    "providedCostDetails",
+    "costDetails",
+    "level",
+    "environment",
+    "bookmarked",
+    "public",
+    "statusMessage",
+    "version",
+    "parentObservationId",
+    "createdAt",
+    "updatedAt",
+    "providedModelName",
+    "totalCost",
+    "usagePricingTierId",
+    "usagePricingTierName",
+    "promptId",
+    "promptName",
+    "promptVersion",
+    "internalModelId",
+    "userId",
+    "sessionId",
+    "traceName",
+    "release",
+    "tags",
+    // Keep lightweight tool names available even when heavy tool payloads are omitted.
     "toolCallNames",
   ],
   calculated: ["latency", "timeToFirstToken"],
   io: ["input", "output"],
   metadata: ["metadata"],
   tools: ["toolDefinitions", "toolCalls", "toolCallNames"],
+  trace_context: ["tags", "release", "traceName"],
+  model_export: ["providedModelName", "modelId", "modelParameters"],
   eventTs: ["eventTs"],
-
+  publicApiExperimentItemCore: [
+    "id",
+    "projectId",
+    "traceId",
+    "startTime",
+    "endTime",
+    "level",
+    "environment",
+    "experimentId",
+    "experimentName",
+    "experimentItemId",
+  ],
+  publicApiExperimentItemDataset: [
+    "experimentDatasetId",
+    "experimentItemVersion",
+  ],
+  publicApiExperimentItemExpectedOutput: ["experimentItemExpectedOutput"],
+  publicApiExperimentItemMetadataFields: ["experimentItemMetadata"],
+  publicApiExperimentItemExperimentMetadata: [
+    "experimentMetadata",
+    "experimentDescription",
+  ],
   // getById field sets (reuse the same fields - all queries use `FROM events_<type> e`)
   byIdBase: [
     "id",
@@ -183,6 +341,13 @@ const FIELD_SETS = {
     "level",
     "statusMessage",
     "version",
+    "release",
+    "userId",
+    "sessionId",
+    "traceName",
+    "tags",
+    "bookmarked",
+    "public",
     "toolDefinitions",
     "toolCalls",
     "toolCallNames",
@@ -196,6 +361,8 @@ const FIELD_SETS = {
     "providedCostDetails",
     "costDetails",
     "totalCost",
+    "usagePricingTierId",
+    "usagePricingTierName",
     "completionStartTime",
   ],
   byIdPrompt: ["promptId", "promptName", "promptVersion"],
@@ -221,10 +388,17 @@ const FIELD_SETS = {
     "public",
     "userId",
     "sessionId",
+    "isRootObservation",
   ],
   time: ["completionStartTime", "createdAt", "updatedAt"],
   model: ["providedModelName", "internalModelId", "modelParameters"],
-  usage: ["usageDetails", "costDetails", "totalCost"],
+  usage: [
+    "usageDetails",
+    "costDetails",
+    "totalCost",
+    "usagePricingTierId",
+    "usagePricingTierName",
+  ],
   prompt: ["promptId", "promptName", "promptVersion"],
   metrics: ["latency", "timeToFirstToken"],
 
@@ -259,6 +433,15 @@ const FIELD_SETS = {
     "release",
     "traceName",
     "parentObservationId",
+    "bookmarked",
+    "public",
+    "createdAt",
+    "updatedAt",
+    "toolDefinitions",
+    "toolCalls",
+    "toolCallNames",
+    "usagePricingTierId",
+    "usagePricingTierName",
   ],
 
   eval: [
@@ -266,6 +449,7 @@ const FIELD_SETS = {
     "traceId",
     "projectId",
     "parentObservationId",
+    "isAppRoot",
     "type",
     "name",
     "environment",
@@ -289,10 +473,49 @@ const FIELD_SETS = {
     "toolDefinitions",
     "toolCalls",
     "toolCallNames",
+    "experimentId",
+    "experimentName",
+    "experimentItemRootSpanId",
+    "experimentItemExpectedOutput",
+    "experimentItemMetadata",
+  ],
+
+  // Experiment items field set
+  experimentItems: [
+    "id", // span_id (observation_id)
+    "traceId",
+    "input",
+    "output",
+    "startTime",
+    "level",
+
+    // Experiment metadata
+    "experimentId",
+    "experimentName",
+    "experimentDatasetId",
+
+    // Experiment item metadata
+    "experimentItemId",
+    "experimentItemRootSpanId",
+    "experimentItemVersion",
+    "experimentItemExpectedOutput",
+    "experimentItemMetadata",
+
+    // Event metadata
+    "metadata",
   ],
 } as const;
 
 export type FieldSetName = keyof typeof FIELD_SETS;
+
+export const OBSERVATION_FIELD_GROUP_FIELD_NAMES = Object.fromEntries(
+  OBSERVATION_FIELD_GROUPS_PUBLIC_API.map((group) => [
+    group,
+    FIELD_SETS[group],
+  ]),
+) as {
+  [K in ObservationFieldGroupPublicApi]: (typeof FIELD_SETS)[K];
+};
 
 /**
  * Aggregation fields for trace-level queries
@@ -304,7 +527,7 @@ const EVENTS_AGGREGATION_FIELDS = {
   projectId: "project_id",
 
   // Aggregated fields
-  name: "argMaxIf(trace_name, event_ts, trace_name <> '') AS name",
+  name: `${eventsTableTraceNameAggregationSql} AS name`,
   timestamp: "min(start_time) as timestamp",
   environment:
     "argMaxIf(environment, event_ts, environment <> '') AS environment",
@@ -316,7 +539,7 @@ const EVENTS_AGGREGATION_FIELDS = {
   // Note: events_core/events_full tables don't have input_truncated/output_truncated columns.
   // Truncation is handled by the materialized view for events_core, or by leftUTF8() at query time.
   metadata:
-    "argMaxIf(mapFromArrays(e.metadata_names, e.metadata_values), event_ts, parent_span_id = '') AS metadata",
+    "argMaxIf(mapFromArrays(arrayReverse(e.metadata_names), arrayReverse(e.metadata_values)), event_ts, parent_span_id = '') AS metadata",
   created_at: "min(created_at) AS created_at",
   updated_at: "max(updated_at) AS updated_at",
   total_cost: "sum(total_cost) AS total_cost",
@@ -324,10 +547,14 @@ const EVENTS_AGGREGATION_FIELDS = {
     "date_diff('millisecond', min(start_time), greatest(max(start_time), max(end_time))) AS latency_milliseconds",
   observation_ids:
     "groupUniqArrayIf(span_id, span_id <> '') AS observation_ids",
+  observation_count:
+    "length(groupUniqArrayIf(span_id, span_id <> '' AND span_id <> concat('t-', trace_id))) AS observation_count",
 
   bookmarked:
     "argMaxIf(bookmarked, event_ts, parent_span_id = '') AS bookmarked",
   public: "max(public) AS public",
+  experiment_item_id:
+    "argMaxIf(experiment_item_id, event_ts, experiment_item_id <> '') AS experiment_item_id",
 
   // Observation-level aggregations for filtering support
   usage_details: "sumMap(usage_details) as usage_details",
@@ -341,6 +568,15 @@ const EVENTS_AGGREGATION_FIELDS = {
 
   tags: "argMaxIf(tags, event_ts, notEmpty(tags)) AS tags",
   release: "argMaxIf(release, event_ts, release <> '') AS release",
+
+  // Evaluator execution fields are stamped on every internal evaluation span.
+  evaluator_id:
+    "argMaxIf(evaluator_id, event_ts, evaluator_id <> '') AS evaluator_id",
+  evaluation_rule_id:
+    "argMaxIf(evaluation_rule_id, event_ts, evaluation_rule_id <> '') AS evaluation_rule_id",
+
+  // experiment fields
+  experiment_id: "any(experiment_id) as experiment_id",
 } as const;
 
 /**
@@ -359,7 +595,7 @@ const AGGREGATION_FIELD_SETS = {
  * // Use when you need to query across all projects (use with caution!)
  * const builder = new EventsQueryBuilder({ projectId: NoProjectId });
  */
-export const NoProjectId = Symbol("NoProjectId");
+const NoProjectId = Symbol("NoProjectId");
 export type NoProjectIdType = typeof NoProjectId;
 
 /**
@@ -368,9 +604,10 @@ export type NoProjectIdType = typeof NoProjectId;
  */
 abstract class AbstractQueryBuilder {
   protected whereClauses: string[] = [];
-  protected orderByClause: string = "";
-  protected limitByClause: string = "";
-  protected limitClause: string = "";
+  protected havingClauses: string[] = [];
+  protected orderByClause = "";
+  protected limitByClause = "";
+  protected limitClause = "";
   protected params: Record<string, any> = {};
 
   /**
@@ -403,6 +640,41 @@ abstract class AbstractQueryBuilder {
   }
 
   /**
+   * Apply filters from a FilterList.
+   * Subclasses can override to add optimizations (e.g., partition pruning).
+   */
+  applyFilters(filterList: FilterList): this {
+    this.where(filterList.apply());
+    return this;
+  }
+
+  /**
+   * Add raw HAVING condition with optional parameters.
+   * Use for post-aggregation filtering in GROUP BY queries.
+   */
+  havingRaw(condition: string, params?: Record<string, any>): this {
+    if (condition.trim()) {
+      this.havingClauses.push(condition);
+    }
+    if (params) {
+      this.params = { ...this.params, ...params };
+    }
+    return this;
+  }
+
+  /**
+   * Add HAVING conditions from FilterList.
+   * Strips leading AND/OR and wraps in parentheses.
+   */
+  having(condition: { query: string; params?: Record<string, any> }): this {
+    if (condition.query.trim()) {
+      const trimmedQuery = condition.query.trim().replace(/^(AND|OR)\s+/i, "");
+      this.havingRaw(`(${trimmedQuery})`, condition.params);
+    }
+    return this;
+  }
+
+  /**
    * Add ORDER BY clause
    */
   orderBy(clause: string): this {
@@ -415,13 +687,14 @@ abstract class AbstractQueryBuilder {
   /**
    * Add ORDER BY using OrderByEntry array for structured API
    */
-  orderByColumns(entries: OrderByEntry[]): this {
-    if (!entries.length) {
-      return this;
+  orderByColumns(
+    entries: OrderByEntry[],
+    options?: OrderByColumnsOptions,
+  ): this {
+    const orderByClause = buildOrderByClause(entries, options);
+    if (orderByClause) {
+      this.orderByClause = orderByClause;
     }
-
-    const columns: string[] = entries.map((e) => `${e.column} ${e.direction}`);
-    this.orderByClause = `ORDER BY ${columns.join(", ")}`;
     return this;
   }
 
@@ -453,6 +726,18 @@ abstract class AbstractQueryBuilder {
   limitBy(...columns: string[]): this {
     if (columns.length > 0) {
       this.limitByClause = `LIMIT 1 BY ${columns.join(", ")}`;
+    }
+
+    return this;
+  }
+
+  /**
+   * Keep up to `limit` rows per unique combination of columns.
+   */
+  limitByCount(limit: number, ...columns: string[]): this {
+    if (columns.length > 0) {
+      this.limitByClause = `LIMIT {limitByCount: Int32} BY ${columns.join(", ")}`;
+      this.params.limitByCount = limit;
     }
 
     return this;
@@ -497,6 +782,14 @@ abstract class AbstractQueryBuilder {
   }
 
   /**
+   * Helper to build HAVING section
+   */
+  protected buildHavingSection(): string {
+    if (this.havingClauses.length === 0) return "";
+    return `HAVING ${this.havingClauses.join("\n  AND ")}`;
+  }
+
+  /**
    * Build the final query string - implemented by subclasses
    */
   protected abstract buildQuery(): string;
@@ -508,6 +801,19 @@ abstract class AbstractQueryBuilder {
 abstract class AbstractCTEQueryBuilder extends AbstractQueryBuilder {
   protected ctes: string[] = [];
   protected joins: string[] = [];
+  protected sampleRowCount: number | null = null;
+
+  /** sampleRows caps the base table read at `rows` events via ClickHouse SAMPLE. */
+  sampleRows(rows: number): this {
+    if (rows > 0) {
+      this.sampleRowCount = Math.floor(rows);
+    }
+    return this;
+  }
+
+  protected buildSampleSection(): string {
+    return this.sampleRowCount === null ? "" : ` SAMPLE ${this.sampleRowCount}`;
+  }
 
   /**
    * Add a CTE (Common Table Expression) to the query
@@ -522,10 +828,26 @@ abstract class AbstractCTEQueryBuilder extends AbstractQueryBuilder {
   }
 
   /**
+   * Add a JOIN of the specified kind
+   */
+  private join(kind: "LEFT" | "INNER", table: string, onClause: string): this {
+    this.joins.push(`${kind} JOIN ${table} ${onClause}`);
+    return this;
+  }
+
+  /**
    * Add a LEFT JOIN
    */
   leftJoin(table: string, onClause: string): this {
-    this.joins.push(`LEFT JOIN ${table} ${onClause}`);
+    this.join("LEFT", table, onClause);
+    return this;
+  }
+
+  /**
+   * Add an INNER JOIN
+   */
+  innerJoin(table: string, onClause: string): this {
+    this.join("INNER", table, onClause);
     return this;
   }
 
@@ -571,38 +893,25 @@ abstract class BaseEventsQueryBuilder<
   }
 
   /**
-   * Set ORDER BY clause with automatic project_id prepending for optimal ClickHouse performance.
-   * The events table has ORDER BY (project_id, start_time, ...) so queries should match.
+   * Set ORDER BY clause. When the sort order includes e.start_time, the
+   * PRIMARY KEY prefix (project_id, toStartOfMinute(start_time)) is prepended
+   * for optimal ClickHouse performance.
    *
    * @example
    * builder.orderByColumns([
    *   { column: "e.start_time", direction: "DESC" },
    *   { column: "e.event_ts", direction: "DESC" },
    * ])
-   * // Produces: ORDER BY e.project_id DESC, e.start_time DESC, e.event_ts DESC
+   * // Produces: ORDER BY e.project_id DESC, toStartOfMinute(e.start_time) DESC, e.start_time DESC, e.event_ts DESC
    */
   orderByColumns(entries: OrderByEntry[]): this {
-    if (!entries.length) {
-      return this;
+    const orderByClause = buildOrderByClause(entries, {
+      eventTableAlias: "e",
+      matchTablePrimaryKey: Boolean(findStartTimeOrderClause(entries, "e")),
+    });
+    if (orderByClause) {
+      this.orderByClause = orderByClause;
     }
-
-    // When ordering by start_time, prepend project_id and toStartOfMinute(e.start_time)
-    // to match the table PRIMARY KEY: (project_id, toStartOfMinute(start_time), xxHash32(trace_id))
-    const startTimeEntry = entries.find((e) =>
-      e.column.replace(/"/g, "").endsWith("start_time"),
-    );
-
-    const columns: string[] = [];
-    if (startTimeEntry) {
-      columns.push(
-        `e.project_id ${startTimeEntry.direction}`,
-        `toStartOfMinute(e.start_time) ${startTimeEntry.direction}`,
-      );
-    }
-
-    columns.push(...entries.map((e) => `${e.column} ${e.direction}`));
-
-    this.orderByClause = `ORDER BY ${columns.join(", ")}`;
     return this;
   }
 
@@ -612,6 +921,26 @@ abstract class BaseEventsQueryBuilder<
    */
   orderByDefault(): this {
     return this.orderByColumns([{ column: "e.start_time", direction: "DESC" }]);
+  }
+
+  /**
+   * Apply filters with automatic query optimizations.
+   * Adds xxHash32 optimization for trace_id equality filters.
+   */
+  override applyFilters(filterList: FilterList): this {
+    const traceIdFilter = filterList.find(
+      (f) =>
+        f.clickhouseTable.startsWith("events") &&
+        f.field === 'e."trace_id"' &&
+        f.operator === "=",
+    );
+    if (traceIdFilter instanceof StringFilter) {
+      this.whereRaw("xxHash32(trace_id) = xxHash32({traceIdXxHash: String})", {
+        traceIdXxHash: traceIdFilter.value,
+      });
+    }
+    super.applyFilters(filterList);
+    return this;
   }
 
   /**
@@ -651,7 +980,7 @@ abstract class BaseEventsQueryBuilder<
 
     // FROM - choose table based on data requirements
     const tableName = this.getTableName();
-    parts.push(`FROM ${tableName} e`);
+    parts.push(`FROM ${tableName} e${this.buildSampleSection()}`);
 
     // JOINs
     const joinSection = this.buildJoinSection();
@@ -674,6 +1003,12 @@ abstract class BaseEventsQueryBuilder<
     const groupBy = this.buildGroupByClause();
     if (groupBy) {
       parts.push(groupBy);
+    }
+
+    // HAVING (only for aggregation queries with post-agg filters)
+    const havingSection = this.buildHavingSection();
+    if (havingSection) {
+      parts.push(havingSection);
     }
 
     // ORDER BY
@@ -711,9 +1046,14 @@ abstract class BaseEventsQueryBuilder<
 export class EventsQueryBuilder extends BaseEventsQueryBuilder<
   typeof EVENTS_FIELDS
 > {
-  private ioFields: { truncated: boolean; charLimit?: number } | null = null;
+  private ioFields:
+    | { mode: "full" }
+    | { mode: "truncated"; charLimit?: number }
+    | { mode: "sizeCapped"; inlineChars: number; previewChars: number }
+    | null = null;
   // Metadata expansion config: null = use truncated (default), string[] = expand specific keys, empty array = expand all
   private metadataExpansionKeys: string[] | null = null;
+  private shouldForceFullTable = false;
   // Raw SELECT expressions for custom columns (e.g., from CTEs)
   private rawSelectExpressions: string[] = [];
 
@@ -776,32 +1116,33 @@ export class EventsQueryBuilder extends BaseEventsQueryBuilder<
   }
 
   /**
-   * Apply filters from a FilterList with automatic query optimizations.
-   * When a trace_id equality filter is detected, adds xxHash32 optimization
-   * for efficient ClickHouse partition pruning.
+   * Add IO fields with optional truncation
    */
-  applyFilters(filterList: FilterList): this {
-    const traceIdFilter = filterList.find(
-      (f) =>
-        // events_full / events_core proof
-        f.clickhouseTable.startsWith("events") &&
-        f.field === 'e."trace_id"' &&
-        f.operator === "=",
-    );
-    if (traceIdFilter instanceof StringFilter) {
-      this.whereRaw("xxHash32(trace_id) = xxHash32({traceIdXxHash: String})", {
-        traceIdXxHash: traceIdFilter.value,
-      });
-    }
-    this.where(filterList.apply());
+  selectIO(truncated = false, charLimit?: number): this {
+    this.ioFields = truncated
+      ? { mode: "truncated", charLimit }
+      : { mode: "full" };
     return this;
   }
 
   /**
-   * Add IO fields with optional truncation
+   * Add IO fields with a per-field size cap: fields whose full length is
+   * within `inlineChars` come back whole; larger fields come back as a
+   * `previewChars` head. True lengths are exposed as `input_length` /
+   * `output_length` so callers can tell a preview from full content.
+   * Metadata values are capped with the same policy. Reads events_full
+   * (true lengths + full under-cap values).
    */
-  selectIO(truncated: boolean = false, charLimit?: number): this {
-    this.ioFields = { truncated, charLimit };
+  selectIOWithSizeCap(inlineChars: number, previewChars: number): this {
+    this.ioFields = { mode: "sizeCapped", inlineChars, previewChars };
+    return this;
+  }
+
+  /**
+   * Force queries to read from events_full instead of events_core.
+   */
+  forceFullTable(): this {
+    this.shouldForceFullTable = true;
     return this;
   }
 
@@ -822,6 +1163,10 @@ export class EventsQueryBuilder extends BaseEventsQueryBuilder<
     ) {
       fieldsToExclude.push("metadata");
     }
+    // Size-capped I/O caps metadata values too (custom SELECT expression below)
+    if (this.ioFields?.mode === "sizeCapped") {
+      fieldsToExclude.push("metadata");
+    }
 
     const fieldsToProcess = [...this.selectFields].filter(
       (f) => !fieldsToExclude.includes(f),
@@ -835,13 +1180,51 @@ export class EventsQueryBuilder extends BaseEventsQueryBuilder<
     // Add I/O fields if configured
     // Note: needsFullTable() is responsible for choosing events_core/events_full (truncated vs full I/O)
     if (this.ioFields) {
-      if (this.ioFields.truncated && this.ioFields.charLimit !== undefined) {
+      if (
+        this.ioFields.mode === "truncated" &&
+        this.ioFields.charLimit !== undefined
+      ) {
         fieldExpressions.push(
           `leftUTF8(input, ${this.ioFields.charLimit}) as input, leftUTF8(output, ${this.ioFields.charLimit}) as output`,
+        );
+      } else if (this.ioFields.mode === "sizeCapped") {
+        const { inlineChars, previewChars } = this.ioFields;
+        // lengthUTF8() is computed inline instead of reading the materialized
+        // input_length/output_length columns: the full value is read by this
+        // select anyway, and not every deployment's events_full is guaranteed
+        // to carry the materialized columns.
+        fieldExpressions.push(
+          `if(lengthUTF8(e.input) <= ${inlineChars}, e.input, leftUTF8(e.input, ${previewChars})) as input`,
+          `if(lengthUTF8(e.output) <= ${inlineChars}, e.output, leftUTF8(e.output, ${previewChars})) as output`,
+          `lengthUTF8(e.input) as input_length`,
+          `lengthUTF8(e.output) as output_length`,
         );
       } else {
         fieldExpressions.push("input, output");
       }
+    }
+
+    // Size-capped metadata: same per-value policy as I/O, plus a truncation
+    // flag and the shipped size so callers can budget and surface capping.
+    // Mirrors the arrayReverse shape of the default metadata expression.
+    if (
+      this.ioFields?.mode === "sizeCapped" &&
+      this.selectFields.has("metadata")
+    ) {
+      const { inlineChars, previewChars } = this.ioFields;
+      fieldExpressions.push(
+        `mapFromArrays(arrayReverse(e.metadata_names), arrayMap(v -> if(lengthUTF8(v) <= ${inlineChars}, v, leftUTF8(v, ${previewChars})), arrayReverse(e.metadata_values))) as metadata`,
+        // The flag checks only each key's WINNING value. A duplicate key ships
+        // both entries in the Map's JSON, and the client's JSON.parse keeps the
+        // last textual duplicate — with the arrayReverse above that resolves to
+        // the FIRST occurrence in the original arrays. A capped value that is
+        // shadowed by a small winner must not raise the flag (verified against
+        // ClickHouse + JSON.parse semantics).
+        `arrayExists((v, i) -> lengthUTF8(v) > ${inlineChars} AND arrayFirstIndex(n -> n = e.metadata_names[i], e.metadata_names) = i, e.metadata_values, arrayEnumerate(e.metadata_values)) as metadata_truncated`,
+        // Shipped metadata weight: every (capped) value counts, duplicates
+        // included, because duplicates are physically in the response.
+        `arraySum(arrayMap(v -> if(lengthUTF8(v) <= ${inlineChars}, lengthUTF8(v), ${previewChars}), e.metadata_values)) as metadata_length`,
+      );
     }
 
     // Add metadata field with expansion if configured
@@ -855,7 +1238,7 @@ export class EventsQueryBuilder extends BaseEventsQueryBuilder<
       // For events_core/events_full, just use mapFromArrays with metadata_values directly
       // The caller should use events_full table if full metadata is needed
       fieldExpressions.push(
-        `mapFromArrays(e.metadata_names, e.metadata_values) as metadata`,
+        `mapFromArrays(arrayReverse(e.metadata_names), arrayReverse(e.metadata_values)) as metadata`,
       );
     }
 
@@ -880,14 +1263,16 @@ export class EventsQueryBuilder extends BaseEventsQueryBuilder<
    * - events_full: full I/O and metadata (when full data is needed)
    */
   private needsFullTable(): boolean {
-    // Need full I/O? (truncated = false means we need full data)
-    const needsFullIO = this.ioFields !== null && !this.ioFields.truncated;
+    // Need full I/O? (anything but the truncated mode needs full data;
+    // sizeCapped needs true lengths + full under-cap values)
+    const needsFullIO =
+      this.ioFields !== null && this.ioFields.mode !== "truncated";
 
     // Need full metadata? (any expansion requested — specific keys or all)
     const needsFullMetadata =
       this.metadataExpansionKeys !== null && this.selectFields.has("metadata");
 
-    return needsFullIO || needsFullMetadata;
+    return needsFullIO || needsFullMetadata || this.shouldForceFullTable;
   }
 
   /**
@@ -961,7 +1346,7 @@ type AliasedColumns<
 export class EventsAggregationQueryBuilder extends BaseEventsQueryBuilder<
   typeof EVENTS_AGGREGATION_FIELDS
 > {
-  private truncated: boolean = true;
+  private truncated = true;
 
   constructor(options: { projectId: string }) {
     super(EVENTS_AGGREGATION_FIELDS, options);
@@ -1093,6 +1478,10 @@ const EVENTS_SESSION_AGGREGATION_FIELDS = {
   trace_tags: "groupUniqArrayArrayIf(tags, notEmpty(tags)) AS trace_tags",
   environment:
     "argMaxIf(environment, event_ts, environment <> '') AS environment",
+  metadata_names:
+    "argMax(metadata_names, tuple(start_time, event_ts, span_id)) AS metadata_names",
+  metadata_values:
+    "argMax(metadata_values, tuple(start_time, event_ts, span_id)) AS metadata_values",
   total_observations:
     "uniqIf(span_id, parent_span_id != '') AS total_observations",
   duration:
@@ -1118,6 +1507,10 @@ const SESSION_AGGREGATION_FIELD_SETS = {
   all: Object.keys(EVENTS_SESSION_AGGREGATION_FIELDS) as Array<
     keyof typeof EVENTS_SESSION_AGGREGATION_FIELDS
   >,
+  base: Object.keys(EVENTS_SESSION_AGGREGATION_FIELDS).filter(
+    (field) => field !== "metadata_names" && field !== "metadata_values",
+  ) as Array<keyof typeof EVENTS_SESSION_AGGREGATION_FIELDS>,
+  metadata: ["metadata_names", "metadata_values"],
 } as const;
 
 /**
@@ -1233,8 +1626,9 @@ export class CTEQueryBuilder<
   private cteSchemas: Map<string, CTESchema> = new Map();
   private joins: string[] = [];
   private selectExpressions: string[] = [];
-  private fromClause: string = "";
-  private fromAlias: string = "";
+  private fromClause = "";
+  private fromAlias = "";
+  private groupByClause = "";
 
   /**
    * Register a CTE with its schema
@@ -1285,10 +1679,14 @@ export class CTEQueryBuilder<
   }
 
   /**
-   * Join another CTE.
+   * Add a JOIN of the specified kind.
    * Only accepts CTE names that have been registered via withCTE().
    */
-  leftJoin<Name extends keyof RegisteredCTEs & string, Alias extends string>(
+  private join<
+    Name extends keyof RegisteredCTEs & string,
+    Alias extends string,
+  >(
+    kind: "LEFT" | "LEFT ANY" | "INNER",
     cteName: Name,
     alias: Alias,
     onClause: string,
@@ -1298,8 +1696,49 @@ export class CTEQueryBuilder<
         `CTE '${cteName}' not registered. Call withCTE('${cteName}', ...) first.`,
       );
     }
-    this.joins.push(`LEFT JOIN ${cteName} ${alias} ${onClause}`);
+    this.joins.push(`${kind} JOIN ${cteName} ${alias} ${onClause}`);
     // Type assertion needed because we're changing the type parameter
+    return this as any;
+  }
+
+  /**
+   * Join another CTE.
+   * Only accepts CTE names that have been registered via withCTE().
+   */
+  leftJoin<Name extends keyof RegisteredCTEs & string, Alias extends string>(
+    cteName: Name,
+    alias: Alias,
+    onClause: string,
+  ): CTEQueryBuilder<RegisteredCTEs, Aliases & Record<Alias, Name>> {
+    this.join("LEFT", cteName, alias, onClause);
+    return this as any;
+  }
+
+  /**
+   * LEFT ANY join another CTE. `ANY` takes exactly one matching row from the
+   * right side, avoiding the row fan-out a plain LEFT JOIN produces when the
+   * right side has un-merged ReplacingMergeTree duplicates.
+   * Only accepts CTE names that have been registered via withCTE().
+   */
+  leftAnyJoin<Name extends keyof RegisteredCTEs & string, Alias extends string>(
+    cteName: Name,
+    alias: Alias,
+    onClause: string,
+  ): CTEQueryBuilder<RegisteredCTEs, Aliases & Record<Alias, Name>> {
+    this.join("LEFT ANY", cteName, alias, onClause);
+    return this as any;
+  }
+
+  /**
+   * Inner join another CTE.
+   * Only accepts CTE names that have been registered via withCTE().
+   */
+  innerJoin<Name extends keyof RegisteredCTEs & string, Alias extends string>(
+    cteName: Name,
+    alias: Alias,
+    onClause: string,
+  ): CTEQueryBuilder<RegisteredCTEs, Aliases & Record<Alias, Name>> {
+    this.join("INNER", cteName, alias, onClause);
     return this as any;
   }
 
@@ -1338,6 +1777,19 @@ export class CTEQueryBuilder<
   }
 
   /**
+   * Add GROUP BY clause
+   *
+   * @example
+   * builder.groupBy("t.project_id", "t.experiment_id")
+   */
+  groupBy(...columns: Array<AliasedColumns<RegisteredCTEs, Aliases>>): this {
+    if (columns.length > 0) {
+      this.groupByClause = columns.join(", ");
+    }
+    return this;
+  }
+
+  /**
    * Build the query
    */
   protected buildQuery(): string {
@@ -1371,6 +1823,17 @@ export class CTEQueryBuilder<
     // WHERE
     if (this.whereClauses.length > 0) {
       parts.push(`WHERE ${this.whereClauses.join("\n  AND ")}`);
+    }
+
+    // GROUP BY
+    if (this.groupByClause) {
+      parts.push(`GROUP BY ${this.groupByClause}`);
+    }
+
+    // HAVING
+    const havingSection = this.buildHavingSection();
+    if (havingSection) {
+      parts.push(havingSection);
     }
 
     // ORDER BY
@@ -1436,7 +1899,7 @@ export class EventsAggQueryBuilder extends AbstractCTEQueryBuilder {
     parts.push(`SELECT ${this.selectExpression}`);
 
     // FROM - use events_core for reads (lightweight table with truncated I/O)
-    parts.push("FROM events_core e");
+    parts.push(`FROM events_core e${this.buildSampleSection()}`);
 
     // JOINs
     const joinSection = this.buildJoinSection();
@@ -1454,6 +1917,12 @@ export class EventsAggQueryBuilder extends AbstractCTEQueryBuilder {
     // GROUP BY
     parts.push(`GROUP BY ${this.groupByColumn}`);
 
+    // HAVING
+    const havingSection = this.buildHavingSection();
+    if (havingSection) {
+      parts.push(havingSection);
+    }
+
     // ORDER BY
     if (this.orderByClause) {
       parts.push(this.orderByClause);
@@ -1466,6 +1935,159 @@ export class EventsAggQueryBuilder extends AbstractCTEQueryBuilder {
     }
 
     return parts.join("\n");
+  }
+}
+
+// ============================================================
+// EXPERIMENTS AGGREGATION BUILDER
+// ============================================================
+
+/**
+ * Aggregation fields for experiment-level queries.
+ * These fields use ClickHouse aggregation functions and require GROUP BY experiment_id, project_id.
+ */
+const EXPERIMENTS_AGGREGATION_FIELDS = {
+  // Base aggregated fields
+  experimentId: "e.experiment_id AS experiment_id",
+  experimentName: "any(e.experiment_name) AS experiment_name",
+  experimentDescription:
+    "any(e.experiment_description) AS experiment_description",
+  experimentDatasetId:
+    "nullIf(any(e.experiment_dataset_id), '') AS experiment_dataset_id",
+  startTime: "min(e.start_time) AS start_time",
+  itemCount: "uniq(e.experiment_item_id) AS item_count",
+  errorCount: "countIf(e.level = 'ERROR') AS error_count",
+  prompts:
+    "groupUniqArrayIf(tuple(e.prompt_name, e.prompt_version), e.prompt_name != '') AS prompts",
+  experimentMetadata:
+    "any(mapFromArrays(e.experiment_metadata_names, e.experiment_metadata_values)) AS experiment_metadata",
+
+  // Metrics fields
+  totalCost: "SUM(e.total_cost) AS total_cost",
+  latencyAvg:
+    "avgIf(date_diff('millisecond', e.start_time, e.end_time), e.span_id = e.experiment_item_root_span_id AND e.end_time IS NOT NULL) AS latency_avg",
+} as const;
+
+/**
+ * Field sets for experiment aggregation queries.
+ */
+const EXPERIMENTS_AGGREGATION_FIELD_SETS = {
+  count: ["experimentId"] as const,
+  base: [
+    "experimentId",
+    "experimentName",
+    "experimentDescription",
+    "experimentDatasetId",
+    "startTime",
+    "itemCount",
+    "errorCount",
+    "prompts",
+    "experimentMetadata",
+  ] as const,
+  metrics: ["experimentId", "totalCost", "latencyAvg"] as const,
+  publicApiSummary: [
+    "experimentId",
+    "experimentName",
+    "experimentDescription",
+    "experimentDatasetId",
+    "startTime",
+  ] as const,
+  publicApiSummaryMetadata: ["experimentMetadata"] as const,
+} as const;
+
+export type ExperimentsAggregationFieldSetName =
+  keyof typeof EXPERIMENTS_AGGREGATION_FIELD_SETS;
+
+/**
+ * ExperimentsAggregationQueryBuilder - Aggregates events by (experiment_id, project_id).
+ *
+ * Use the "metrics" field set for cost and latency aggregations:
+ * - Cost: SUM of all event costs for the experiment
+ * - Latency: AVG of root span duration (where span_id = experiment_item_root_span_id)
+ */
+export class ExperimentsAggregationQueryBuilder extends BaseEventsQueryBuilder<
+  typeof EXPERIMENTS_AGGREGATION_FIELDS
+> {
+  private selectedFieldSets: Set<ExperimentsAggregationFieldSetName> =
+    new Set();
+  private rawSelectExpressions: string[] = [];
+
+  constructor(opts: { projectId: string }) {
+    super(EXPERIMENTS_AGGREGATION_FIELDS, { projectId: opts.projectId });
+  }
+
+  /**
+   * Add experiment IDs filter
+   */
+  withExperimentIds(experimentIds?: string[]): this {
+    return this.when(Boolean(experimentIds && experimentIds.length > 0), (b) =>
+      b.whereRaw("e.experiment_id IN ({experimentIds: Array(String)})", {
+        experimentIds,
+      }),
+    );
+  }
+
+  /**
+   * Add start time filter with OBSERVATIONS_TO_TRACE_INTERVAL.
+   */
+  withStartTimeFrom(startTimeFrom?: string | null): this {
+    return this.when(Boolean(startTimeFrom), (b) =>
+      b.whereRaw(
+        `e.start_time >= {startTimeFrom: DateTime64(3)} - ${OBSERVATIONS_TO_TRACE_INTERVAL}`,
+        { startTimeFrom },
+      ),
+    );
+  }
+
+  /**
+   * Select a field set for the query output.
+   * Use "count" for count queries, "base" for full row data.
+   */
+  selectFieldSet(...sets: ExperimentsAggregationFieldSetName[]): this {
+    sets.forEach((s) => this.selectedFieldSets.add(s));
+    return this;
+  }
+
+  /**
+   * Add raw SELECT expressions (for score aggregations, custom columns, etc.)
+   * These are appended after field set columns.
+   */
+  selectRaw(...expressions: string[]): this {
+    this.rawSelectExpressions.push(...expressions);
+    return this;
+  }
+
+  /**
+   * Build the SELECT clause for experiment aggregation queries.
+   */
+  protected buildSelectClause(): string {
+    const fields: string[] = [];
+
+    // Add fields from selected field sets
+    for (const setName of this.selectedFieldSets) {
+      const fieldKeys = EXPERIMENTS_AGGREGATION_FIELD_SETS[setName];
+      for (const key of fieldKeys) {
+        const fieldExpr =
+          EXPERIMENTS_AGGREGATION_FIELDS[
+            key as keyof typeof EXPERIMENTS_AGGREGATION_FIELDS
+          ];
+        if (fieldExpr) {
+          fields.push(fieldExpr);
+        }
+      }
+    }
+
+    // Add raw select expressions (e.g., score aggregations from CTE JOINs)
+    fields.push(...this.rawSelectExpressions);
+
+    return `SELECT\n  ${fields.join(",\n  ")}`;
+  }
+
+  /**
+   * Build the GROUP BY clause for experiment aggregations.
+   */
+  protected buildGroupByClause(): string {
+    return "GROUP BY e.project_id, e.experiment_id";
   }
 }
 
@@ -1509,7 +2131,7 @@ export function buildEventsFullTableSplitQuery(opts: {
   }
   if (opts.includeMetadata) {
     ioSelectParts.push(
-      "mapFromArrays(e.metadata_names, e.metadata_values) as metadata",
+      "mapFromArrays(arrayReverse(e.metadata_names), arrayReverse(e.metadata_values)) as metadata",
     );
   }
   const ioQuery = [
@@ -1543,7 +2165,10 @@ export function buildEventsFullTableSplitQuery(opts: {
       schema: [] as string[],
     })
     .from("base", "b")
-    .leftJoin(
+    // LEFT ANY JOIN (not LEFT JOIN): the io CTE reads events_full, which can
+    // hold un-merged ReplacingMergeTree duplicates. A plain LEFT JOIN would
+    // fan out to N_base × N_io rows; ANY takes one matching io row per base row.
+    .leftAnyJoin(
       "io",
       "i",
       'ON b."start_time" = i."_io_start_time" AND b."trace_id" = i."_io_trace_id" AND b.id = i._io_id',

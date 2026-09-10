@@ -1,6 +1,6 @@
 import { useRouter } from "next/router";
 import { api } from "@/src/utils/api";
-import { formatLocalIsoDate } from "@/src/components/LocalIsoDate";
+import { formatLocalIsoDate } from "@/src/utils/dates";
 import { BillingCurrentPlanLabel } from "./BillingCurrentPlanLabel";
 
 export const BillingPlanPeriodView = () => {
@@ -13,7 +13,7 @@ export const BillingPlanPeriodView = () => {
   );
 
   return (
-    <div className="flex flex-col gap-1 text-sm text-muted-foreground">
+    <div className="text-muted-foreground flex flex-col gap-1 text-sm">
       <BillingCurrentPlanLabel />
       <p>
         Billing period:{" "}
@@ -26,5 +26,3 @@ export const BillingPlanPeriodView = () => {
     </div>
   );
 };
-
-export default BillingPlanPeriodView;

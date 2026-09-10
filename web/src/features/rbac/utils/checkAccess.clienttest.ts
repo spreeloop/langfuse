@@ -1,3 +1,5 @@
+// @vitest-environment node
+
 import { hasOrganizationAccess } from "./checkOrganizationAccess";
 import { hasProjectAccess } from "./checkProjectAccess";
 
@@ -66,6 +68,15 @@ describe("RBAC access checks", () => {
       hasProjectAccess({
         role: "ADMIN",
         scope: "project:update",
+      }),
+    ).toBe(true);
+  });
+
+  it("allows members to manage llm tools", () => {
+    expect(
+      hasProjectAccess({
+        role: "MEMBER",
+        scope: "llmTools:CUD",
       }),
     ).toBe(true);
   });

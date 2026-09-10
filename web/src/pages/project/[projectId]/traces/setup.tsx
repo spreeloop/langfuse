@@ -1,14 +1,14 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import { useRouter } from "next/router";
-import { api } from "@/src/utils/api";
+import { api, reportNonTrpcError } from "@/src/utils/api";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 import ContainerPage from "@/src/components/layouts/container-page";
 import { ActionButton } from "@/src/components/ActionButton";
 import { SubHeader } from "@/src/components/layouts/header";
 import { Button } from "@/src/components/ui/button";
-import { ApiKeyRender } from "@/src/features/public-api/components/CreateApiKeyButton";
+import { ApiKeyDetailContent } from "@/src/features/public-api/components/ApiKeyDetailContent";
+import { useLangfuseBaseUrl } from "@/src/features/public-api/hooks/useLangfuseEnvCode";
 import { type RouterOutput } from "@/src/utils/types";
-import { useState } from "react";
 import { useQueryProject } from "@/src/features/projects/hooks";
 
 export const TracingSetup = ({
@@ -18,6 +18,7 @@ export const TracingSetup = ({
   projectId: string;
   hasTracingConfigured?: boolean;
 }) => {
+  const baseUrl = useLangfuseBaseUrl();
   const [apiKeys, setApiKeys] = useState<
     RouterOutput["projectApiKeys"]["create"] | null
   >(null);
@@ -33,7 +34,7 @@ export const TracingSetup = ({
     try {
       await mutCreateApiKey.mutateAsync({ projectId });
     } catch (error) {
-      console.error("Error creating API key:", error);
+      reportNonTrpcError(error, "setup");
     }
   };
 
@@ -42,14 +43,17 @@ export const TracingSetup = ({
       <div>
         <SubHeader title="1. Get API keys" />
         {apiKeys ? (
-          <ApiKeyRender
-            generatedKeys={apiKeys}
-            scope={"project"}
+          <ApiKeyDetailContent
+            scope="project"
+            secretKey={apiKeys.secretKey}
+            publicKey={apiKeys.publicKey}
+            baseUrl={baseUrl}
             className="mt-4"
+            showMcpSection={false}
           />
         ) : (
           <div className="flex flex-col gap-4">
-            <p className="text-sm text-muted-foreground">
+            <p className="text-muted-foreground text-sm">
               You need to create an API key to start tracing your application.
               You can create more keys later in the project settings.
             </p>
@@ -77,7 +81,7 @@ export const TracingSetup = ({
           title="2. Add tracing to your application"
           status={hasTracingConfigured ? "active" : "pending"}
         />
-        <p className="mb-4 text-sm text-muted-foreground">
+        <p className="text-muted-foreground mb-4 text-sm">
           Langfuse relies on OpenTelemetry to instrument your application and
           export LLM application/agent traces to Langfuse. You can use one of
           our SDKs or 50+ framework integrations. Please follow the quickstart

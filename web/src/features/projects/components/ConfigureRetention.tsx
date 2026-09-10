@@ -1,7 +1,7 @@
 import { Card } from "@/src/components/ui/card";
 import { Input } from "@/src/components/ui/input";
-import { api } from "@/src/utils/api";
-import type * as z from "zod/v4";
+import { api, reportTrpcErrorWithoutToast } from "@/src/utils/api";
+import type * as z from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import {
@@ -12,17 +12,18 @@ import {
   FormMessage,
 } from "@/src/components/ui/form";
 import Header from "@/src/components/layouts/header";
-import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
+import { usePostHogClientCapture } from "@/src/features/posthog-analytics";
 import { LockIcon } from "lucide-react";
 import { useQueryProject } from "@/src/features/projects/hooks";
 import { useSession } from "next-auth/react";
-import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
-import { projectRetentionSchema } from "@/src/features/auth/lib/projectRetentionSchema";
+import { useHasProjectAccess } from "@/src/features/rbac";
+import { projectRetentionSchema } from "@/src/features/auth";
 import { ActionButton } from "@/src/components/ActionButton";
-import { useHasEntitlement } from "@/src/features/entitlements/hooks";
+import { useHasEntitlement } from "@/src/features/entitlements";
 
 export default function ConfigureRetention() {
   const { update: updateSession } = useSession();
+  const utils = api.useUtils();
   const { project } = useQueryProject();
   const capture = usePostHogClientCapture();
   const hasAccess = useHasProjectAccess({
@@ -39,7 +40,10 @@ export default function ConfigureRetention() {
   });
   const setRetention = api.projects.setRetention.useMutation({
     onSuccess: (_) => {
-      void updateSession();
+      updateSession();
+      // Admins resolve org/project context from these queries, not the session
+      utils.organizations.byId.invalidate();
+      utils.projects.byId.invalidate();
     },
     onError: (error) => form.setError("retention", { message: error.message }),
   });
@@ -55,16 +59,14 @@ export default function ConfigureRetention() {
       .then(() => {
         form.reset();
       })
-      .catch((error) => {
-        console.error(error);
-      });
+      .catch((error) => reportTrpcErrorWithoutToast(error, "projects"));
   }
 
   return (
     <div>
       <Header title="Data Retention" />
       <Card className="mb-4 p-3">
-        <p className="mb-4 text-sm text-primary">
+        <p className="text-primary mb-4 text-sm">
           Data retention automatically deletes events older than the specified
           number of days. The value must be 0 or at least 3 days. Set to 0 to
           retain data indefinitely. The deletion happens asynchronously, i.e.
@@ -72,7 +74,7 @@ export default function ConfigureRetention() {
         </p>
         {Boolean(form.getValues().retention) &&
         form.getValues().retention !== project?.retentionDays ? (
-          <p className="mb-4 text-sm text-primary">
+          <p className="text-primary mb-4 text-sm">
             Your Project&#39;s retention will be set from &quot;
             {project?.retentionDays ?? "Indefinite"}
             &quot; to &quot;
@@ -82,11 +84,11 @@ export default function ConfigureRetention() {
             &quot; days.
           </p>
         ) : !Boolean(project?.retentionDays) ? (
-          <p className="mb-4 text-sm text-primary">
+          <p className="text-primary mb-4 text-sm">
             Your Project retains data indefinitely.
           </p>
         ) : (
-          <p className="mb-4 text-sm text-primary">
+          <p className="text-primary mb-4 text-sm">
             Your Project&#39;s current retention is &quot;
             {project?.retentionDays ?? ""}
             &quot; days.
@@ -116,7 +118,7 @@ export default function ConfigureRetention() {
                       />
                       {!hasAccess && (
                         <span title="No access">
-                          <LockIcon className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 transform text-muted" />
+                          <LockIcon className="text-muted absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 transform" />
                         </span>
                       )}
                     </div>
@@ -125,17 +127,18 @@ export default function ConfigureRetention() {
                 </FormItem>
               )}
             />
-            <ActionButton
-              variant="secondary"
-              hasAccess={hasAccess}
-              hasEntitlement={hasEntitlement}
-              loading={setRetention.isPending}
-              disabled={form.getValues().retention === null}
-              className="mt-4"
-              type="submit"
-            >
-              Save
-            </ActionButton>
+            <div className="mt-4">
+              <ActionButton
+                variant="secondary"
+                hasAccess={hasAccess}
+                hasEntitlement={hasEntitlement}
+                loading={setRetention.isPending}
+                disabled={form.getValues().retention === null}
+                type="submit"
+              >
+                Save
+              </ActionButton>
+            </div>
           </form>
         </Form>
       </Card>

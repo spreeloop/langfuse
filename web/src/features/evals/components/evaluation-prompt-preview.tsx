@@ -1,3 +1,4 @@
+/* eslint-disable @repo/no-style-props */
 import { ItemBadge, type LangfuseItemType } from "@/src/components/ItemBadge";
 import { Skeleton } from "@/src/components/ui/skeleton";
 import { useExtractVariables } from "@/src/features/evals/hooks/useExtractVariables";
@@ -93,14 +94,14 @@ const ColoredPromptView = ({
   return (
     <div className={cn("flex flex-col", className)}>
       <div className="relative flex flex-col gap-2">
-        <pre className="flex-1 whitespace-pre-wrap break-words p-3 font-mono text-xs">
+        <pre className="flex-1 p-3 font-mono text-xs wrap-break-word whitespace-pre-wrap">
           {fragments.map((fragment, idx) => (
             <Fragment key={idx}>
               {fragment.type === "text" ? (
                 fragment.content
               ) : (
                 <ColoredVariable
-                  value={fragment.value || ""}
+                  value={fragment.value ?? ""}
                   index={fragment.colorIndex || 0}
                 />
               )}
@@ -119,6 +120,7 @@ export const EvaluationPromptPreview = ({
   variableMapping,
   isLoading,
   showControls = true,
+  showTargetBadge = true,
   className,
   controlButtons,
 }: {
@@ -128,6 +130,7 @@ export const EvaluationPromptPreview = ({
   variableMapping: VariableMapping[];
   isLoading: boolean;
   showControls?: boolean;
+  showTargetBadge?: boolean;
   className?: string;
   controlButtons?: React.ReactNode;
 }) => {
@@ -173,7 +176,7 @@ export const EvaluationPromptPreview = ({
       // Add variable
       const variableName = match[1];
       const variableValue =
-        extractedVariables.find((v) => v.variable === variableName)?.value ||
+        extractedVariables.find((v) => v.variable === variableName)?.value ??
         "";
 
       fragments.push({
@@ -232,10 +235,10 @@ export const EvaluationPromptPreview = ({
 
   return (
     <div className={cn("flex flex-col", className)}>
-      <span className="mb-1 flex flex-row items-center justify-between py-0 text-sm font-medium capitalize">
+      <span className="mb-1 flex flex-row items-center justify-between py-0 text-sm font-bold capitalize">
         <div className="flex flex-row items-center gap-2">
           Evaluation Prompt Preview
-          {targetLink && (
+          {showTargetBadge && targetLink && (
             <Link
               href={targetLink.href}
               className="hover:cursor-pointer"

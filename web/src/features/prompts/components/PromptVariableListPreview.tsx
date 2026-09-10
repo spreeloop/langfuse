@@ -5,13 +5,9 @@ export const PromptVariableListPreview = ({
 }: {
   variables: string[];
 }) => {
-  if (variables.length === 0) {
-    return null;
-  }
-
   return (
     <div>
-      <p className="mb-2 text-sm text-muted-foreground">
+      <p className="text-muted-foreground mb-2 text-sm">
         The following variables are available:
       </p>
       <div className="flex min-h-6 flex-wrap gap-2">
